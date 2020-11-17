@@ -230,7 +230,7 @@ void PolishProgram::processTomograms(
 		MotionFit motionFit(
 				CCs, projByTime, particleSet, particles[t], referenceMap.image_FS,
 				motParams, mfSettings, tomogram.centre,
-				tomogram.getFrameDose(), tomogram.optics.pixelSize, padding, num_threads);
+				tomogram.getFrameDose(), tomogram.optics.pixelSize, padding, 0, num_threads);
 
 
 		BufferedImage<double> FCC3, FCC1, specCC;
