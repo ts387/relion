@@ -14,6 +14,11 @@
 #include "src/acc/hip/custom_allocator.h"
 #include "src/acc/hip/hip_mem_utils.h"
 #include "src/acc/hip/shortcuts.h"
+#elif _METAL_ENABLED
+#include "src/acc/metal/metal_settings.h"
+#include "src/acc/metal/custom_allocator.h"
+#include "src/acc/metal/metal_mem_utils.h"
+#include "src/acc/metal/shortcuts.h"
 #elif _SYCL_ENABLED
 #include <sstream>
 #include <string>
@@ -48,7 +53,7 @@ static void HandleAccPtrDebugFatal( const char *err, const char *file, int line 
 {
     	fprintf(stderr, "DEBUG ERROR: %s in %s:%d\n", err, file, line );
 		fflush(stdout);
-#if defined(DEBUG_CUDA) || defined(DEBUG_HIP)
+#if defined(DEBUG_CUDA) || defined(DEBUG_HIP) || defined(DEBUG_METAL)
 		raise(SIGSEGV);
 #else
 		CRITICAL(ERRGPUKERN);
@@ -62,7 +67,7 @@ static void HandleAccPtrDebugInformational( const char *err, const char *file, i
 		fflush(stdout);
 }
 
-enum AccType {accUNSET, accSYCL, accHIP, accCUDA, accCPU};
+enum AccType {accUNSET, accSYCL, accHIP, accCUDA, accMETAL, accCPU};
 
 
 #ifdef _CUDA_ENABLED
@@ -73,6 +78,10 @@ typedef CudaCustomAllocator::Alloc AllocationType;
 typedef hipStream_t StreamType;
 typedef HipCustomAllocator AllocatorType;
 typedef HipCustomAllocator::Alloc AllocationType;
+#elif _METAL_ENABLED
+typedef deviceStream_t StreamType;
+typedef MetalCustomAllocator AllocatorType;
+typedef MetalCustomAllocator::Alloc AllocationType;
 #else
 using StreamType = deviceStream_t;
 using AllocatorType = double;  //Dummy type
