@@ -4,9 +4,9 @@
 
 This directory contains the Metal GPU acceleration backend for RELION, enabling native GPU support on Apple Silicon (M-Series) Macs.
 
-**Status:** Phase 1 - Foundation & Infrastructure (COMPLETE)
+**Status:** Phase 2A - Kernel Infrastructure (IN PROGRESS)
 
-**Implementation Date:** 2025-11-15
+**Implementation Date:** 2025-11-15 (Phase 1), 2025-11-15 (Phase 2A)
 
 ## Architecture
 
@@ -36,8 +36,12 @@ src/acc/metal/
 ├── metal_mem_utils.h/.mm           # Memory allocation and transfer functions
 ├── custom_allocator.h/.mm          # Metal buffer pool allocator
 ├── metal_device.h/.mm              # Device management and command queues
+├── metal_kernel_utils.h/.mm        # Kernel launcher infrastructure
+├── metal_fft.h/.mm                 # FFT operations (vDSP/Accelerate wrapper)
 └── metal_kernels/
-    └── helper.metal                # Common MSL utility functions
+    ├── helper.metal                # Common MSL utility functions
+    ├── utilities.metal             # Basic utility kernels
+    └── projection.metal            # Projection/backprojection kernel stubs
 ```
 
 ## Building with Metal Support
@@ -76,24 +80,40 @@ make -j$(sysctl -n hw.ncpu)
 - [x] AccPtr<T> integration
 - [x] Basic MSL helper functions
 
-### Phase 2: Core Kernels (NOT YET IMPLEMENTED)
+### Phase 2A: Kernel Infrastructure ⚙️ IN PROGRESS
 
-- [ ] Projection kernels (diff2_coarse, diff2_fine)
-- [ ] Backprojection kernels (2D/3D)
-- [ ] Weighted averaging (wavg)
-- [ ] FFT operations (MPS integration)
+- [x] Kernel launcher infrastructure (KernelLauncher class)
+- [x] FFT wrapper (vDSP/Accelerate-based, CPU fallback)
+- [x] Utility kernels (multiply, exponentiate, softmask, weights_exponent, etc.)
+- [x] Projection kernel infrastructure and helpers
+- [x] Basic AccProjectorKernel port
+- [ ] Full diff2_coarse/fine kernel implementations ⏳ TODO
+- [ ] Full backprojection kernel implementations ⏳ TODO
+- [ ] Full weighted averaging implementation ⏳ TODO
+- [ ] GPU-accelerated FFT (custom Metal kernels) ⏳ TODO
 
-### Phase 3: Advanced Features (NOT YET IMPLEMENTED)
+**Note**: Phase 2A provides the infrastructure and simplified kernel stubs. Full kernel implementations matching CUDA performance will be completed in Phase 2B.
+
+### Phase 2B: Full Kernel Implementations ⏳ PLANNED
+
+- [ ] Complete diff2_coarse kernels (2D/3D variants)
+- [ ] Complete diff2_fine kernels (2D/3D variants)
+- [ ] Complete backprojection kernels (2D/3D/SGD)
+- [ ] Complete weighted averaging kernels
+- [ ] GPU-based FFT using custom Metal compute shaders
+- [ ] Kernel optimization and performance tuning
+
+### Phase 3: Advanced Features (NOT YET STARTED)
 
 - [ ] Auto-picker GPU acceleration
-- [ ] Random number generation
-- [ ] Multi-GPU support
+- [ ] Random number generation (Philox RNG)
+- [ ] Multi-GPU support and load balancing
 - [ ] Performance optimization
 
-### Phase 4: Integration & Testing (NOT YET IMPLEMENTED)
+### Phase 4: Integration & Testing (NOT YET STARTED)
 
-- [ ] Host code integration
-- [ ] Validation tests
+- [ ] Full host code integration
+- [ ] Validation tests against CUDA backend
 - [ ] Performance benchmarks
 
 ## Key Features
@@ -191,7 +211,7 @@ std::cout << "Memory: " << info.totalMemory / (1024*1024) << " MB" << std::endl;
 
 ## Testing
 
-Phase 1 includes basic infrastructure but no functional kernels yet. To test the build:
+Phase 2A includes kernel infrastructure but full implementations are stubs. To test the build:
 
 ```bash
 # Verify Metal support is compiled
@@ -203,18 +223,21 @@ nm build/lib/librelion_lib.a | grep -i metal
 
 ## Known Issues
 
-1. **Double Precision**: Metal has limited support for double precision on consumer GPUs
-2. **Texture Memory**: Replaced with buffer-based interpolation (may impact performance)
-3. **Atomics**: Metal atomics have different semantics than CUDA
-4. **Debugging**: Limited tooling compared to CUDA (use Metal Debugger in Xcode)
+1. **FFT Currently CPU-Based**: Using vDSP/Accelerate framework (CPU) as fallback until GPU-accelerated FFT is implemented
+2. **Kernel Stubs**: diff2, backprojection, and wavg kernels are infrastructure only - full implementations TODO
+3. **Double Precision**: Metal has limited support for double precision on consumer GPUs
+4. **Texture Memory**: Replaced with buffer-based interpolation (may impact performance)
+5. **Atomics**: Metal atomics have different semantics than CUDA
+6. **Debugging**: Limited tooling compared to CUDA (use Metal Debugger in Xcode)
 
-## Next Steps (Phase 2)
+## Next Steps (Phase 2B)
 
-1. Implement core projection kernels (diff2.metal)
-2. Implement backprojection kernels (BP.metal)
-3. Integrate Metal Performance Shaders for FFT
-4. Port weighted averaging kernels (wavg.metal)
-5. Create validation tests against CUDA reference
+1. Complete diff2_coarse/fine kernel implementations
+2. Complete backprojection kernel implementations (2D/3D/SGD)
+3. Complete weighted averaging kernels
+4. Implement GPU-accelerated FFT using custom Metal compute shaders
+5. Performance optimization and tuning
+6. Validation tests against CUDA backend
 
 ## Contributing
 
