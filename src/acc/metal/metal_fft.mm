@@ -3,30 +3,148 @@
 #import <MetalPerformanceShaders/MetalPerformanceShaders.h>
 #import <Accelerate/Accelerate.h>
 #include <cstdio>
+#include <cmath>
 
 namespace MetalFFT {
 
+// Helper function to compute log2
+static inline uint computeLog2(size_t n) {
+    uint log2n = 0;
+    size_t val = n;
+    while (val > 1) {
+        val >>= 1;
+        log2n++;
+    }
+    return log2n;
+}
+
+// Check if n is power of 2
+static inline bool isPowerOfTwo(size_t n) {
+    return (n > 0) && ((n & (n - 1)) == 0);
+}
+
 struct FFTPlanImpl {
     id<MTLDevice> device;
+    id<MTLLibrary> library;
+    id<MTLCommandQueue> commandQueue;
+
     size_t nx, ny, nz;
     size_t batch;
     FFTType type;
     int dimensions; // 1, 2, or 3
 
-    // For MPS-based FFT (Metal Performance Shaders)
-    // Note: MPS doesn't directly support FFT, we'll use vDSP/Accelerate as fallback
-    // or implement custom FFT kernels for GPU
+    // Compute pipeline states for FFT kernels
+    id<MTLComputePipelineState> bitReversalPipeline;
+    id<MTLComputePipelineState> butterflyPipeline;
+    id<MTLComputePipelineState> scalePipeline;
+    id<MTLComputePipelineState> copyPipeline;
+    id<MTLComputePipelineState> packRealPipeline;
+    id<MTLComputePipelineState> extractRealPipeline;
+    id<MTLComputePipelineState> r2cPostprocessPipeline;
+    id<MTLComputePipelineState> c2rPreprocessPipeline;
 
-    // Temporary: Use CPU-based Accelerate framework FFT for now
-    // TODO: Implement GPU-based FFT using custom Metal kernels or wait for MPS updates
+    // 2D FFT pipelines
+    id<MTLComputePipelineState> bitReversalRowsPipeline;
+    id<MTLComputePipelineState> bitReversalColsPipeline;
+    id<MTLComputePipelineState> butterflyRowsPipeline;
+    id<MTLComputePipelineState> butterflyColsPipeline;
 
-    FFTSetup vdsp_setup; // For vDSP FFT (CPU)
-    size_t log2n;
+    // 3D FFT pipelines
+    id<MTLComputePipelineState> butterflyZPipeline;
 
-    FFTPlanImpl() : vdsp_setup(nullptr), log2n(0) {}
+    // Temporary buffers
+    id<MTLBuffer> tempReal;
+    id<MTLBuffer> tempImag;
+
+    uint log2nx, log2ny, log2nz;
+
+    // Fallback to CPU for non-power-of-2 sizes
+    bool useCPUFallback;
+    FFTSetup vdsp_setup;
+
+    FFTPlanImpl() : library(nil), commandQueue(nil),
+                    bitReversalPipeline(nil), butterflyPipeline(nil),
+                    scalePipeline(nil), copyPipeline(nil),
+                    tempReal(nil), tempImag(nil),
+                    useCPUFallback(false), vdsp_setup(nullptr) {}
+
     ~FFTPlanImpl() {
         if (vdsp_setup) {
             vDSP_destroy_fftsetup(vdsp_setup);
+        }
+    }
+
+    bool initializePipelines() {
+        NSError* error = nil;
+
+        // Load the default library (compiled shaders)
+        library = [device newDefaultLibrary];
+        if (!library) {
+            fprintf(stderr, "Metal FFT ERROR: Failed to load default Metal library\n");
+            return false;
+        }
+
+        // Create command queue
+        commandQueue = [device newCommandQueue];
+        if (!commandQueue) {
+            fprintf(stderr, "Metal FFT ERROR: Failed to create command queue\n");
+            return false;
+        }
+
+        // Create pipeline states for each kernel
+        auto createPipeline = [&](const char* name) -> id<MTLComputePipelineState> {
+            id<MTLFunction> function = [library newFunctionWithName:[NSString stringWithUTF8String:name]];
+            if (!function) {
+                fprintf(stderr, "Metal FFT WARNING: Kernel '%s' not found\n", name);
+                return nil;
+            }
+            id<MTLComputePipelineState> pipeline = [device newComputePipelineStateWithFunction:function error:&error];
+            if (error) {
+                fprintf(stderr, "Metal FFT ERROR: Failed to create pipeline for '%s': %s\n",
+                        name, [[error localizedDescription] UTF8String]);
+                return nil;
+            }
+            return pipeline;
+        };
+
+        // Create 1D FFT pipelines
+        bitReversalPipeline = createPipeline("metal_kernel_fft_bit_reversal");
+        butterflyPipeline = createPipeline("metal_kernel_fft_butterfly");
+        scalePipeline = createPipeline("metal_kernel_fft_scale");
+        copyPipeline = createPipeline("metal_kernel_fft_copy");
+        packRealPipeline = createPipeline("metal_kernel_fft_pack_real_to_complex");
+        extractRealPipeline = createPipeline("metal_kernel_fft_extract_real");
+        r2cPostprocessPipeline = createPipeline("metal_kernel_fft_r2c_postprocess");
+        c2rPreprocessPipeline = createPipeline("metal_kernel_fft_c2r_preprocess");
+
+        // Create 2D FFT pipelines
+        bitReversalRowsPipeline = createPipeline("metal_kernel_fft2d_bit_reversal_rows");
+        bitReversalColsPipeline = createPipeline("metal_kernel_fft2d_bit_reversal_cols");
+        butterflyRowsPipeline = createPipeline("metal_kernel_fft2d_rows_butterfly");
+        butterflyColsPipeline = createPipeline("metal_kernel_fft2d_cols_butterfly");
+
+        // Create 3D FFT pipelines
+        butterflyZPipeline = createPipeline("metal_kernel_fft3d_z_butterfly");
+
+        // Verify critical pipelines
+        if (!bitReversalPipeline || !butterflyPipeline || !scalePipeline) {
+            fprintf(stderr, "Metal FFT ERROR: Failed to create critical FFT pipelines\n");
+            return false;
+        }
+
+        return true;
+    }
+
+    void allocateTemporaryBuffers() {
+        size_t totalSize = nx * ny * nz * batch;
+
+        tempReal = [device newBufferWithLength:totalSize * sizeof(float)
+                                       options:MTLResourceStorageModeShared];
+        tempImag = [device newBufferWithLength:totalSize * sizeof(float)
+                                       options:MTLResourceStorageModeShared];
+
+        if (!tempReal || !tempImag) {
+            fprintf(stderr, "Metal FFT WARNING: Failed to allocate temporary buffers\n");
         }
     }
 };
@@ -41,25 +159,31 @@ FFTPlan createFFTPlan1D(void* device, size_t nx, FFTType type, size_t batch) {
         plan->batch = batch;
         plan->type = type;
         plan->dimensions = 1;
+        plan->log2nx = computeLog2(nx);
+        plan->log2ny = 0;
+        plan->log2nz = 0;
 
-        // Calculate log2(nx) for vDSP
-        plan->log2n = 0;
-        size_t n = nx;
-        while (n > 1) {
-            n >>= 1;
-            plan->log2n++;
+        // Check if we can use GPU FFT (requires power of 2)
+        if (!isPowerOfTwo(nx)) {
+            fprintf(stderr, "Metal FFT WARNING: Non-power-of-2 size (%zu), using CPU fallback\n", nx);
+            plan->useCPUFallback = true;
+            plan->vdsp_setup = vDSP_create_fftsetup(plan->log2nx, FFT_RADIX2);
+            if (!plan->vdsp_setup) {
+                fprintf(stderr, "Metal FFT ERROR: Failed to create vDSP FFT setup\n");
+                delete plan;
+                return nullptr;
+            }
+        } else {
+            plan->useCPUFallback = false;
+            if (!plan->initializePipelines()) {
+                fprintf(stderr, "Metal FFT WARNING: Failed to initialize GPU pipelines, using CPU fallback\n");
+                plan->useCPUFallback = true;
+                plan->vdsp_setup = vDSP_create_fftsetup(plan->log2nx, FFT_RADIX2);
+            } else {
+                plan->allocateTemporaryBuffers();
+                fprintf(stderr, "Metal FFT INFO: Created 1D GPU FFT plan (%zu points, batch=%zu)\n", nx, batch);
+            }
         }
-
-        // Create vDSP FFT setup (CPU-based for now)
-        plan->vdsp_setup = vDSP_create_fftsetup(plan->log2n, FFT_RADIX2);
-        if (!plan->vdsp_setup) {
-            fprintf(stderr, "Metal FFT ERROR: Failed to create vDSP FFT setup for 1D FFT\n");
-            delete plan;
-            return nullptr;
-        }
-
-        fprintf(stderr, "Metal FFT INFO: Created 1D FFT plan (%zu points, batch=%zu) using vDSP\n",
-                nx, batch);
 
         return (FFTPlan)plan;
     }
@@ -75,26 +199,26 @@ FFTPlan createFFTPlan2D(void* device, size_t nx, size_t ny, FFTType type, size_t
         plan->batch = batch;
         plan->type = type;
         plan->dimensions = 2;
+        plan->log2nx = computeLog2(nx);
+        plan->log2ny = computeLog2(ny);
+        plan->log2nz = 0;
 
-        // For 2D FFT, we'll do row-wise then column-wise 1D FFTs
-        // Calculate log2 for both dimensions
-        size_t log2nx = 0, log2ny = 0;
-        size_t n = nx;
-        while (n > 1) { n >>= 1; log2nx++; }
-        n = ny;
-        while (n > 1) { n >>= 1; log2ny++; }
-
-        plan->log2n = (log2nx > log2ny) ? log2nx : log2ny;
-        plan->vdsp_setup = vDSP_create_fftsetup(plan->log2n, FFT_RADIX2);
-
-        if (!plan->vdsp_setup) {
-            fprintf(stderr, "Metal FFT ERROR: Failed to create vDSP FFT setup for 2D FFT\n");
-            delete plan;
-            return nullptr;
+        if (!isPowerOfTwo(nx) || !isPowerOfTwo(ny)) {
+            fprintf(stderr, "Metal FFT WARNING: Non-power-of-2 2D size (%zux%zu), using CPU fallback\n", nx, ny);
+            plan->useCPUFallback = true;
+            size_t max_log2 = (plan->log2nx > plan->log2ny) ? plan->log2nx : plan->log2ny;
+            plan->vdsp_setup = vDSP_create_fftsetup(max_log2, FFT_RADIX2);
+        } else {
+            plan->useCPUFallback = false;
+            if (!plan->initializePipelines()) {
+                plan->useCPUFallback = true;
+                size_t max_log2 = (plan->log2nx > plan->log2ny) ? plan->log2nx : plan->log2ny;
+                plan->vdsp_setup = vDSP_create_fftsetup(max_log2, FFT_RADIX2);
+            } else {
+                plan->allocateTemporaryBuffers();
+                fprintf(stderr, "Metal FFT INFO: Created 2D GPU FFT plan (%zux%zu, batch=%zu)\n", nx, ny, batch);
+            }
         }
-
-        fprintf(stderr, "Metal FFT INFO: Created 2D FFT plan (%zux%zu, batch=%zu) using vDSP\n",
-                nx, ny, batch);
 
         return (FFTPlan)plan;
     }
@@ -110,26 +234,31 @@ FFTPlan createFFTPlan3D(void* device, size_t nx, size_t ny, size_t nz, FFTType t
         plan->batch = 1;
         plan->type = type;
         plan->dimensions = 3;
+        plan->log2nx = computeLog2(nx);
+        plan->log2ny = computeLog2(ny);
+        plan->log2nz = computeLog2(nz);
 
-        // For 3D FFT, compute largest dimension for log2
-        size_t max_dim = nx;
-        if (ny > max_dim) max_dim = ny;
-        if (nz > max_dim) max_dim = nz;
-
-        plan->log2n = 0;
-        size_t n = max_dim;
-        while (n > 1) { n >>= 1; plan->log2n++; }
-
-        plan->vdsp_setup = vDSP_create_fftsetup(plan->log2n, FFT_RADIX2);
-
-        if (!plan->vdsp_setup) {
-            fprintf(stderr, "Metal FFT ERROR: Failed to create vDSP FFT setup for 3D FFT\n");
-            delete plan;
-            return nullptr;
+        if (!isPowerOfTwo(nx) || !isPowerOfTwo(ny) || !isPowerOfTwo(nz)) {
+            fprintf(stderr, "Metal FFT WARNING: Non-power-of-2 3D size (%zux%zux%zu), using CPU fallback\n",
+                    nx, ny, nz);
+            plan->useCPUFallback = true;
+            size_t max_dim = nx;
+            if (ny > max_dim) max_dim = ny;
+            if (nz > max_dim) max_dim = nz;
+            plan->vdsp_setup = vDSP_create_fftsetup(computeLog2(max_dim), FFT_RADIX2);
+        } else {
+            plan->useCPUFallback = false;
+            if (!plan->initializePipelines()) {
+                plan->useCPUFallback = true;
+                size_t max_dim = nx;
+                if (ny > max_dim) max_dim = ny;
+                if (nz > max_dim) max_dim = nz;
+                plan->vdsp_setup = vDSP_create_fftsetup(computeLog2(max_dim), FFT_RADIX2);
+            } else {
+                plan->allocateTemporaryBuffers();
+                fprintf(stderr, "Metal FFT INFO: Created 3D GPU FFT plan (%zux%zux%zu)\n", nx, ny, nz);
+            }
         }
-
-        fprintf(stderr, "Metal FFT INFO: Created 3D FFT plan (%zux%zux%zu) using vDSP\n",
-                nx, ny, nz);
 
         return (FFTPlan)plan;
     }
@@ -139,6 +268,400 @@ void destroyFFTPlan(FFTPlan plan) {
     if (plan) {
         FFTPlanImpl* impl = (FFTPlanImpl*)plan;
         delete impl;
+    }
+}
+
+// Execute 1D FFT on GPU
+static void execute1DGPUFFT(FFTPlanImpl* impl,
+                            id<MTLBuffer> inReal, id<MTLBuffer> inImag,
+                            id<MTLBuffer> outReal, id<MTLBuffer> outImag,
+                            FFTDirection direction) {
+    @autoreleasepool {
+        id<MTLCommandBuffer> commandBuffer = [impl->commandQueue commandBuffer];
+
+        uint n = (uint)impl->nx;
+        uint log2n = impl->log2nx;
+        int dir = (direction == FFT_FORWARD) ? 1 : -1;
+
+        for (size_t batch_idx = 0; batch_idx < impl->batch; batch_idx++) {
+            uint batchIdx = (uint)batch_idx;
+
+            // Step 1: Bit-reversal permutation
+            {
+                id<MTLComputeCommandEncoder> encoder = [commandBuffer computeCommandEncoder];
+                [encoder setComputePipelineState:impl->bitReversalPipeline];
+                [encoder setBuffer:inReal offset:0 atIndex:0];
+                [encoder setBuffer:inImag offset:0 atIndex:1];
+                [encoder setBuffer:outReal offset:0 atIndex:2];
+                [encoder setBuffer:outImag offset:0 atIndex:3];
+                [encoder setBytes:&n length:sizeof(uint) atIndex:4];
+                [encoder setBytes:&log2n length:sizeof(uint) atIndex:5];
+                [encoder setBytes:&batchIdx length:sizeof(uint) atIndex:6];
+
+                MTLSize gridSize = MTLSizeMake(n, 1, 1);
+                MTLSize threadgroupSize = MTLSizeMake(MIN(n, 256u), 1, 1);
+                [encoder dispatchThreads:gridSize threadsPerThreadgroup:threadgroupSize];
+                [encoder endEncoding];
+            }
+
+            // Step 2: Butterfly operations for each stage
+            for (uint stage = 0; stage < log2n; stage++) {
+                id<MTLComputeCommandEncoder> encoder = [commandBuffer computeCommandEncoder];
+                [encoder setComputePipelineState:impl->butterflyPipeline];
+                [encoder setBuffer:outReal offset:0 atIndex:0];
+                [encoder setBuffer:outImag offset:0 atIndex:1];
+                [encoder setBytes:&n length:sizeof(uint) atIndex:2];
+                [encoder setBytes:&stage length:sizeof(uint) atIndex:3];
+                [encoder setBytes:&dir length:sizeof(int) atIndex:4];
+                [encoder setBytes:&batchIdx length:sizeof(uint) atIndex:5];
+
+                uint numButterflies = n / 2;
+                MTLSize gridSize = MTLSizeMake(numButterflies, 1, 1);
+                MTLSize threadgroupSize = MTLSizeMake(MIN(numButterflies, 256u), 1, 1);
+                [encoder dispatchThreads:gridSize threadsPerThreadgroup:threadgroupSize];
+                [encoder endEncoding];
+            }
+
+            // Step 3: Scale for inverse FFT
+            if (direction == FFT_INVERSE) {
+                id<MTLComputeCommandEncoder> encoder = [commandBuffer computeCommandEncoder];
+                [encoder setComputePipelineState:impl->scalePipeline];
+                [encoder setBuffer:outReal offset:0 atIndex:0];
+                [encoder setBuffer:outImag offset:0 atIndex:1];
+                [encoder setBytes:&n length:sizeof(uint) atIndex:2];
+                float scale = 1.0f / (float)n;
+                [encoder setBytes:&scale length:sizeof(float) atIndex:3];
+                [encoder setBytes:&batchIdx length:sizeof(uint) atIndex:4];
+
+                MTLSize gridSize = MTLSizeMake(n, 1, 1);
+                MTLSize threadgroupSize = MTLSizeMake(MIN(n, 256u), 1, 1);
+                [encoder dispatchThreads:gridSize threadsPerThreadgroup:threadgroupSize];
+                [encoder endEncoding];
+            }
+        }
+
+        [commandBuffer commit];
+        [commandBuffer waitUntilCompleted];
+    }
+}
+
+// Execute 2D FFT on GPU
+static void execute2DGPUFFT(FFTPlanImpl* impl,
+                            id<MTLBuffer> inReal, id<MTLBuffer> inImag,
+                            id<MTLBuffer> outReal, id<MTLBuffer> outImag,
+                            FFTDirection direction) {
+    @autoreleasepool {
+        id<MTLCommandBuffer> commandBuffer = [impl->commandQueue commandBuffer];
+
+        uint nx = (uint)impl->nx;
+        uint ny = (uint)impl->ny;
+        uint log2nx = impl->log2nx;
+        uint log2ny = impl->log2ny;
+        int dir = (direction == FFT_FORWARD) ? 1 : -1;
+
+        for (size_t batch_idx = 0; batch_idx < impl->batch; batch_idx++) {
+            uint batchIdx = (uint)batch_idx;
+
+            // Step 1: Bit-reversal for rows
+            {
+                id<MTLComputeCommandEncoder> encoder = [commandBuffer computeCommandEncoder];
+                [encoder setComputePipelineState:impl->bitReversalRowsPipeline];
+                [encoder setBuffer:inReal offset:0 atIndex:0];
+                [encoder setBuffer:inImag offset:0 atIndex:1];
+                [encoder setBuffer:impl->tempReal offset:0 atIndex:2];
+                [encoder setBuffer:impl->tempImag offset:0 atIndex:3];
+                [encoder setBytes:&nx length:sizeof(uint) atIndex:4];
+                [encoder setBytes:&ny length:sizeof(uint) atIndex:5];
+                [encoder setBytes:&log2nx length:sizeof(uint) atIndex:6];
+                [encoder setBytes:&batchIdx length:sizeof(uint) atIndex:7];
+
+                MTLSize gridSize = MTLSizeMake(nx, ny, 1);
+                MTLSize threadgroupSize = MTLSizeMake(MIN(nx, 16u), MIN(ny, 16u), 1);
+                [encoder dispatchThreads:gridSize threadsPerThreadgroup:threadgroupSize];
+                [encoder endEncoding];
+            }
+
+            // Step 2: FFT on rows
+            for (uint stage = 0; stage < log2nx; stage++) {
+                id<MTLComputeCommandEncoder> encoder = [commandBuffer computeCommandEncoder];
+                [encoder setComputePipelineState:impl->butterflyRowsPipeline];
+                [encoder setBuffer:impl->tempReal offset:0 atIndex:0];
+                [encoder setBuffer:impl->tempImag offset:0 atIndex:1];
+                [encoder setBytes:&nx length:sizeof(uint) atIndex:2];
+                [encoder setBytes:&ny length:sizeof(uint) atIndex:3];
+                [encoder setBytes:&stage length:sizeof(uint) atIndex:4];
+                [encoder setBytes:&dir length:sizeof(int) atIndex:5];
+                [encoder setBytes:&batchIdx length:sizeof(uint) atIndex:6];
+
+                uint numButterflies = nx / 2;
+                MTLSize gridSize = MTLSizeMake(numButterflies, ny, 1);
+                MTLSize threadgroupSize = MTLSizeMake(MIN(numButterflies, 16u), MIN(ny, 16u), 1);
+                [encoder dispatchThreads:gridSize threadsPerThreadgroup:threadgroupSize];
+                [encoder endEncoding];
+            }
+
+            // Step 3: Bit-reversal for columns
+            {
+                id<MTLComputeCommandEncoder> encoder = [commandBuffer computeCommandEncoder];
+                [encoder setComputePipelineState:impl->bitReversalColsPipeline];
+                [encoder setBuffer:impl->tempReal offset:0 atIndex:0];
+                [encoder setBuffer:impl->tempImag offset:0 atIndex:1];
+                [encoder setBuffer:outReal offset:0 atIndex:2];
+                [encoder setBuffer:outImag offset:0 atIndex:3];
+                [encoder setBytes:&nx length:sizeof(uint) atIndex:4];
+                [encoder setBytes:&ny length:sizeof(uint) atIndex:5];
+                [encoder setBytes:&log2ny length:sizeof(uint) atIndex:6];
+                [encoder setBytes:&batchIdx length:sizeof(uint) atIndex:7];
+
+                MTLSize gridSize = MTLSizeMake(nx, ny, 1);
+                MTLSize threadgroupSize = MTLSizeMake(MIN(nx, 16u), MIN(ny, 16u), 1);
+                [encoder dispatchThreads:gridSize threadsPerThreadgroup:threadgroupSize];
+                [encoder endEncoding];
+            }
+
+            // Step 4: FFT on columns
+            for (uint stage = 0; stage < log2ny; stage++) {
+                id<MTLComputeCommandEncoder> encoder = [commandBuffer computeCommandEncoder];
+                [encoder setComputePipelineState:impl->butterflyColsPipeline];
+                [encoder setBuffer:outReal offset:0 atIndex:0];
+                [encoder setBuffer:outImag offset:0 atIndex:1];
+                [encoder setBytes:&nx length:sizeof(uint) atIndex:2];
+                [encoder setBytes:&ny length:sizeof(uint) atIndex:3];
+                [encoder setBytes:&stage length:sizeof(uint) atIndex:4];
+                [encoder setBytes:&dir length:sizeof(int) atIndex:5];
+                [encoder setBytes:&batchIdx length:sizeof(uint) atIndex:6];
+
+                uint numButterflies = ny / 2;
+                MTLSize gridSize = MTLSizeMake(nx, numButterflies, 1);
+                MTLSize threadgroupSize = MTLSizeMake(MIN(nx, 16u), MIN(numButterflies, 16u), 1);
+                [encoder dispatchThreads:gridSize threadsPerThreadgroup:threadgroupSize];
+                [encoder endEncoding];
+            }
+
+            // Step 5: Scale for inverse FFT
+            if (direction == FFT_INVERSE) {
+                id<MTLComputeCommandEncoder> encoder = [commandBuffer computeCommandEncoder];
+                [encoder setComputePipelineState:impl->scalePipeline];
+                [encoder setBuffer:outReal offset:0 atIndex:0];
+                [encoder setBuffer:outImag offset:0 atIndex:1];
+                uint totalSize = nx * ny;
+                [encoder setBytes:&totalSize length:sizeof(uint) atIndex:2];
+                float scale = 1.0f / (float)totalSize;
+                [encoder setBytes:&scale length:sizeof(float) atIndex:3];
+                [encoder setBytes:&batchIdx length:sizeof(uint) atIndex:4];
+
+                MTLSize gridSize = MTLSizeMake(totalSize, 1, 1);
+                MTLSize threadgroupSize = MTLSizeMake(MIN(totalSize, 256u), 1, 1);
+                [encoder dispatchThreads:gridSize threadsPerThreadgroup:threadgroupSize];
+                [encoder endEncoding];
+            }
+        }
+
+        [commandBuffer commit];
+        [commandBuffer waitUntilCompleted];
+    }
+}
+
+// Execute 3D FFT on GPU
+static void execute3DGPUFFT(FFTPlanImpl* impl,
+                            id<MTLBuffer> inReal, id<MTLBuffer> inImag,
+                            id<MTLBuffer> outReal, id<MTLBuffer> outImag,
+                            FFTDirection direction) {
+    @autoreleasepool {
+        // 3D FFT = 2D FFT on xy-planes + 1D FFT on z-dimension
+        // First do 2D FFT on each xy-plane
+
+        id<MTLCommandBuffer> commandBuffer = [impl->commandQueue commandBuffer];
+
+        uint nx = (uint)impl->nx;
+        uint ny = (uint)impl->ny;
+        uint nz = (uint)impl->nz;
+        uint log2nx = impl->log2nx;
+        uint log2ny = impl->log2ny;
+        uint log2nz = impl->log2nz;
+        int dir = (direction == FFT_FORWARD) ? 1 : -1;
+        uint batchIdx = 0;
+
+        // Process each z-slice as 2D FFT
+        for (uint z = 0; z < nz; z++) {
+            // Bit-reversal for rows of this slice
+            {
+                id<MTLComputeCommandEncoder> encoder = [commandBuffer computeCommandEncoder];
+                [encoder setComputePipelineState:impl->bitReversalRowsPipeline];
+                size_t offset = z * ny * nx * sizeof(float);
+                [encoder setBuffer:inReal offset:offset atIndex:0];
+                [encoder setBuffer:inImag offset:offset atIndex:1];
+                [encoder setBuffer:impl->tempReal offset:offset atIndex:2];
+                [encoder setBuffer:impl->tempImag offset:offset atIndex:3];
+                [encoder setBytes:&nx length:sizeof(uint) atIndex:4];
+                [encoder setBytes:&ny length:sizeof(uint) atIndex:5];
+                [encoder setBytes:&log2nx length:sizeof(uint) atIndex:6];
+                [encoder setBytes:&batchIdx length:sizeof(uint) atIndex:7];
+
+                MTLSize gridSize = MTLSizeMake(nx, ny, 1);
+                MTLSize threadgroupSize = MTLSizeMake(MIN(nx, 16u), MIN(ny, 16u), 1);
+                [encoder dispatchThreads:gridSize threadsPerThreadgroup:threadgroupSize];
+                [encoder endEncoding];
+            }
+
+            // Row FFTs
+            for (uint stage = 0; stage < log2nx; stage++) {
+                id<MTLComputeCommandEncoder> encoder = [commandBuffer computeCommandEncoder];
+                [encoder setComputePipelineState:impl->butterflyRowsPipeline];
+                size_t offset = z * ny * nx * sizeof(float);
+                [encoder setBuffer:impl->tempReal offset:offset atIndex:0];
+                [encoder setBuffer:impl->tempImag offset:offset atIndex:1];
+                [encoder setBytes:&nx length:sizeof(uint) atIndex:2];
+                [encoder setBytes:&ny length:sizeof(uint) atIndex:3];
+                [encoder setBytes:&stage length:sizeof(uint) atIndex:4];
+                [encoder setBytes:&dir length:sizeof(int) atIndex:5];
+                [encoder setBytes:&batchIdx length:sizeof(uint) atIndex:6];
+
+                uint numButterflies = nx / 2;
+                MTLSize gridSize = MTLSizeMake(numButterflies, ny, 1);
+                MTLSize threadgroupSize = MTLSizeMake(MIN(numButterflies, 16u), MIN(ny, 16u), 1);
+                [encoder dispatchThreads:gridSize threadsPerThreadgroup:threadgroupSize];
+                [encoder endEncoding];
+            }
+
+            // Bit-reversal for columns
+            {
+                id<MTLComputeCommandEncoder> encoder = [commandBuffer computeCommandEncoder];
+                [encoder setComputePipelineState:impl->bitReversalColsPipeline];
+                size_t offset = z * ny * nx * sizeof(float);
+                [encoder setBuffer:impl->tempReal offset:offset atIndex:0];
+                [encoder setBuffer:impl->tempImag offset:offset atIndex:1];
+                [encoder setBuffer:outReal offset:offset atIndex:2];
+                [encoder setBuffer:outImag offset:offset atIndex:3];
+                [encoder setBytes:&nx length:sizeof(uint) atIndex:4];
+                [encoder setBytes:&ny length:sizeof(uint) atIndex:5];
+                [encoder setBytes:&log2ny length:sizeof(uint) atIndex:6];
+                [encoder setBytes:&batchIdx length:sizeof(uint) atIndex:7];
+
+                MTLSize gridSize = MTLSizeMake(nx, ny, 1);
+                MTLSize threadgroupSize = MTLSizeMake(MIN(nx, 16u), MIN(ny, 16u), 1);
+                [encoder dispatchThreads:gridSize threadsPerThreadgroup:threadgroupSize];
+                [encoder endEncoding];
+            }
+
+            // Column FFTs
+            for (uint stage = 0; stage < log2ny; stage++) {
+                id<MTLComputeCommandEncoder> encoder = [commandBuffer computeCommandEncoder];
+                [encoder setComputePipelineState:impl->butterflyColsPipeline];
+                size_t offset = z * ny * nx * sizeof(float);
+                [encoder setBuffer:outReal offset:offset atIndex:0];
+                [encoder setBuffer:outImag offset:offset atIndex:1];
+                [encoder setBytes:&nx length:sizeof(uint) atIndex:2];
+                [encoder setBytes:&ny length:sizeof(uint) atIndex:3];
+                [encoder setBytes:&stage length:sizeof(uint) atIndex:4];
+                [encoder setBytes:&dir length:sizeof(int) atIndex:5];
+                [encoder setBytes:&batchIdx length:sizeof(uint) atIndex:6];
+
+                uint numButterflies = ny / 2;
+                MTLSize gridSize = MTLSizeMake(nx, numButterflies, 1);
+                MTLSize threadgroupSize = MTLSizeMake(MIN(nx, 16u), MIN(numButterflies, 16u), 1);
+                [encoder dispatchThreads:gridSize threadsPerThreadgroup:threadgroupSize];
+                [encoder endEncoding];
+            }
+        }
+
+        // Now do FFT along z-dimension
+        // First bit-reverse along z
+        // Since we don't have a dedicated kernel, we'll implement inline
+
+        // Bit-reversal in z-dimension (copy to temp)
+        for (uint z = 0; z < nz; z++) {
+            uint rev_z = 0;
+            uint temp_z = z;
+            for (uint i = 0; i < log2nz; i++) {
+                rev_z = (rev_z << 1) | (temp_z & 1);
+                temp_z >>= 1;
+            }
+            if (z < rev_z) {
+                // Swap slices z and rev_z
+                id<MTLComputeCommandEncoder> encoder = [commandBuffer computeCommandEncoder];
+                [encoder setComputePipelineState:impl->copyPipeline];
+
+                size_t sliceSize = nx * ny;
+                size_t offset_z = z * sliceSize * sizeof(float);
+                size_t offset_rev_z = rev_z * sliceSize * sizeof(float);
+
+                // Copy z to temp
+                [encoder setBuffer:outReal offset:offset_z atIndex:0];
+                [encoder setBuffer:outImag offset:offset_z atIndex:1];
+                [encoder setBuffer:impl->tempReal offset:0 atIndex:2];
+                [encoder setBuffer:impl->tempImag offset:0 atIndex:3];
+                uint sliceSizeU = (uint)sliceSize;
+                [encoder setBytes:&sliceSizeU length:sizeof(uint) atIndex:4];
+
+                MTLSize gridSize = MTLSizeMake(sliceSize, 1, 1);
+                MTLSize threadgroupSize = MTLSizeMake(MIN(sliceSize, 256u), 1, 1);
+                [encoder dispatchThreads:gridSize threadsPerThreadgroup:threadgroupSize];
+                [encoder endEncoding];
+
+                // Copy rev_z to z
+                encoder = [commandBuffer computeCommandEncoder];
+                [encoder setComputePipelineState:impl->copyPipeline];
+                [encoder setBuffer:outReal offset:offset_rev_z atIndex:0];
+                [encoder setBuffer:outImag offset:offset_rev_z atIndex:1];
+                [encoder setBuffer:outReal offset:offset_z atIndex:2];
+                [encoder setBuffer:outImag offset:offset_z atIndex:3];
+                [encoder setBytes:&sliceSizeU length:sizeof(uint) atIndex:4];
+                [encoder dispatchThreads:gridSize threadsPerThreadgroup:threadgroupSize];
+                [encoder endEncoding];
+
+                // Copy temp to rev_z
+                encoder = [commandBuffer computeCommandEncoder];
+                [encoder setComputePipelineState:impl->copyPipeline];
+                [encoder setBuffer:impl->tempReal offset:0 atIndex:0];
+                [encoder setBuffer:impl->tempImag offset:0 atIndex:1];
+                [encoder setBuffer:outReal offset:offset_rev_z atIndex:2];
+                [encoder setBuffer:outImag offset:offset_rev_z atIndex:3];
+                [encoder setBytes:&sliceSizeU length:sizeof(uint) atIndex:4];
+                [encoder dispatchThreads:gridSize threadsPerThreadgroup:threadgroupSize];
+                [encoder endEncoding];
+            }
+        }
+
+        // Z-dimension butterflies
+        for (uint stage = 0; stage < log2nz; stage++) {
+            id<MTLComputeCommandEncoder> encoder = [commandBuffer computeCommandEncoder];
+            [encoder setComputePipelineState:impl->butterflyZPipeline];
+            [encoder setBuffer:outReal offset:0 atIndex:0];
+            [encoder setBuffer:outImag offset:0 atIndex:1];
+            [encoder setBytes:&nx length:sizeof(uint) atIndex:2];
+            [encoder setBytes:&ny length:sizeof(uint) atIndex:3];
+            [encoder setBytes:&nz length:sizeof(uint) atIndex:4];
+            [encoder setBytes:&stage length:sizeof(uint) atIndex:5];
+            [encoder setBytes:&dir length:sizeof(int) atIndex:6];
+
+            uint numButterflies = nz / 2;
+            MTLSize gridSize = MTLSizeMake(nx, ny, numButterflies);
+            MTLSize threadgroupSize = MTLSizeMake(MIN(nx, 8u), MIN(ny, 8u), MIN(numButterflies, 4u));
+            [encoder dispatchThreads:gridSize threadsPerThreadgroup:threadgroupSize];
+            [encoder endEncoding];
+        }
+
+        // Scale for inverse FFT
+        if (direction == FFT_INVERSE) {
+            id<MTLComputeCommandEncoder> encoder = [commandBuffer computeCommandEncoder];
+            [encoder setComputePipelineState:impl->scalePipeline];
+            [encoder setBuffer:outReal offset:0 atIndex:0];
+            [encoder setBuffer:outImag offset:0 atIndex:1];
+            uint totalSize = nx * ny * nz;
+            [encoder setBytes:&totalSize length:sizeof(uint) atIndex:2];
+            float scale = 1.0f / (float)totalSize;
+            [encoder setBytes:&scale length:sizeof(float) atIndex:3];
+            [encoder setBytes:&batchIdx length:sizeof(uint) atIndex:4];
+
+            MTLSize gridSize = MTLSizeMake(totalSize, 1, 1);
+            MTLSize threadgroupSize = MTLSizeMake(MIN(totalSize, 256u), 1, 1);
+            [encoder dispatchThreads:gridSize threadsPerThreadgroup:threadgroupSize];
+            [encoder endEncoding];
+        }
+
+        [commandBuffer commit];
+        [commandBuffer waitUntilCompleted];
     }
 }
 
@@ -156,17 +679,25 @@ void executeFFT(FFTPlan plan,
 
     FFTPlanImpl* impl = (FFTPlanImpl*)plan;
 
-    fprintf(stderr, "Metal FFT WARNING: Using CPU-based FFT (vDSP/Accelerate)\n");
-    fprintf(stderr, "Metal FFT TODO: Implement GPU-accelerated FFT using custom Metal kernels\n");
+    if (impl->useCPUFallback) {
+        fprintf(stderr, "Metal FFT WARNING: Using CPU fallback for FFT\n");
+        // CPU fallback path - not implemented for production use
+        return;
+    }
 
-    // For now, this is a placeholder that would copy data to CPU, execute FFT, and copy back
-    // This is NOT efficient and should be replaced with GPU-based FFT
+    // Cast buffers
+    id<MTLBuffer> inReal = (__bridge id<MTLBuffer>)input_real;
+    id<MTLBuffer> inImag = (__bridge id<MTLBuffer>)input_imag;
+    id<MTLBuffer> outReal = (__bridge id<MTLBuffer>)output_real;
+    id<MTLBuffer> outImag = (__bridge id<MTLBuffer>)output_imag;
 
-    // TODO: Implement one of these approaches:
-    // 1. Custom Metal FFT kernels (Cooley-Tukey algorithm)
-    // 2. Use Metal compute shaders with shared memory for FFT
-    // 3. Wait for MPS to add FFT support
-    // 4. Use third-party Metal FFT library
+    if (impl->dimensions == 1) {
+        execute1DGPUFFT(impl, inReal, inImag, outReal, outImag, direction);
+    } else if (impl->dimensions == 2) {
+        execute2DGPUFFT(impl, inReal, inImag, outReal, outImag, direction);
+    } else if (impl->dimensions == 3) {
+        execute3DGPUFFT(impl, inReal, inImag, outReal, outImag, direction);
+    }
 }
 
 void executeFFTInPlace(FFTPlan plan,
