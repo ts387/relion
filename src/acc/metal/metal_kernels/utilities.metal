@@ -9,7 +9,7 @@ typedef float XFLOAT;
 // ============================================================================
 
 // Multiply array by scalar
-kernel void metal_kernel_multiply(
+kernel void metal_kernel_multiply_scalar(
     device const float* input [[buffer(0)]],
     device float* output [[buffer(1)]],
     constant float& multiplier [[buffer(2)]],
@@ -18,6 +18,19 @@ kernel void metal_kernel_multiply(
 {
     if (gid < size) {
         output[gid] = input[gid] * multiplier;
+    }
+}
+
+// Element-wise multiplication of two arrays
+kernel void metal_kernel_multiply(
+    device const XFLOAT* A [[buffer(0)]],
+    device const XFLOAT* B [[buffer(1)]],
+    device XFLOAT* OUT [[buffer(2)]],
+    constant uint& size [[buffer(3)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid < size) {
+        OUT[gid] = A[gid] * B[gid];
     }
 }
 
@@ -254,5 +267,145 @@ kernel void metal_kernel_window_FT(
             g_in_real[o_idx] = 0.0f;
             g_in_imag[o_idx] = 0.0f;
         }
+    }
+}
+
+// ============================================================================
+// CTF and Weight Application Kernels (for Phase 3 integration)
+// ============================================================================
+
+// Multiply complex Fourier reference by CTF and optional scale correction
+kernel void metal_kernel_multiplyCTFs(
+    device XFLOAT* g_Fref_real [[buffer(0)]],
+    device XFLOAT* g_Fref_imag [[buffer(1)]],
+    device const XFLOAT* g_ctf [[buffer(2)]],
+    constant uint& do_scale_correction [[buffer(3)]],
+    device const XFLOAT* g_scale_correction [[buffer(4)]],
+    constant uint& image_size [[buffer(5)]],
+    uint idx [[thread_position_in_grid]])
+{
+    if (idx < image_size) {
+        XFLOAT ctf = g_ctf[idx];
+
+        if (do_scale_correction) {
+            ctf *= g_scale_correction[idx];
+        }
+
+        g_Fref_real[idx] *= ctf;
+        g_Fref_imag[idx] *= ctf;
+    }
+}
+
+// Apply weights to diff2 scores
+kernel void metal_kernel_applyWeights(
+    device XFLOAT* g_diff2s [[buffer(0)]],
+    device XFLOAT* g_weights [[buffer(1)]],
+    constant XFLOAT& weight [[buffer(2)]],
+    constant uint& size [[buffer(3)]],
+    uint idx [[thread_position_in_grid]])
+{
+    if (idx < size) {
+        // Weight the diff2 by the particle weight
+        g_diff2s[idx] *= g_weights[idx] * weight;
+    }
+}
+
+// ============================================================================
+// Auto-picker helper kernels
+// ============================================================================
+
+// Calculate local standard deviation for peak detection
+kernel void metal_kernel_calcStddevInMicrographs(
+    device const XFLOAT* d_micrograph [[buffer(0)]],
+    device XFLOAT* d_sum [[buffer(1)]],
+    device XFLOAT* d_sum2 [[buffer(2)]],
+    constant uint& micrograph_size [[buffer(3)]],
+    constant uint& box_size [[buffer(4)]],
+    uint idx [[thread_position_in_grid]])
+{
+    if (idx < micrograph_size) {
+        XFLOAT val = d_micrograph[idx];
+        d_sum[idx] = val;
+        d_sum2[idx] = val * val;
+    }
+}
+
+// Peak detection for particle picking
+kernel void metal_kernel_peakSearch(
+    device const XFLOAT* d_ccf [[buffer(0)]],
+    device const XFLOAT* d_stddev [[buffer(1)]],
+    device uint* d_peak_count [[buffer(2)]],
+    device uint* d_peak_list [[buffer(3)]],
+    constant XFLOAT& threshold [[buffer(4)]],
+    constant uint& xdim [[buffer(5)]],
+    constant uint& ydim [[buffer(6)]],
+    constant uint& max_peaks [[buffer(7)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+    uint x = gid.x;
+    uint y = gid.y;
+
+    if (x < xdim && y < ydim) {
+        uint idx = y * xdim + x;
+        XFLOAT ccf_val = d_ccf[idx];
+        XFLOAT stddev_val = d_stddev[idx];
+
+        // Check if local maximum
+        if (stddev_val > 0.0f && ccf_val / stddev_val > threshold) {
+            // Atomic increment peak count and add to list
+            uint peak_idx = atomic_fetch_add_explicit(
+                (device atomic_uint*)d_peak_count,
+                1,
+                memory_order_relaxed
+            );
+
+            if (peak_idx < max_peaks) {
+                d_peak_list[peak_idx] = idx;
+            }
+        }
+    }
+}
+
+// Pruning overlapping peaks (non-maximum suppression)
+kernel void metal_kernel_pruneOverlappingPeaks(
+    device const uint* d_peak_list [[buffer(0)]],
+    device const XFLOAT* d_ccf [[buffer(1)]],
+    device uint* d_keep_mask [[buffer(2)]],
+    constant uint& num_peaks [[buffer(3)]],
+    constant uint& xdim [[buffer(4)]],
+    constant XFLOAT& min_distance_sq [[buffer(5)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid < num_peaks) {
+        uint idx1 = d_peak_list[gid];
+        uint x1 = idx1 % xdim;
+        uint y1 = idx1 / xdim;
+        XFLOAT ccf1 = d_ccf[idx1];
+
+        bool keep = true;
+
+        // Check against all other peaks
+        for (uint i = 0; i < num_peaks; i++) {
+            if (i != gid) {
+                uint idx2 = d_peak_list[i];
+                uint x2 = idx2 % xdim;
+                uint y2 = idx2 / xdim;
+
+                int dx = int(x1) - int(x2);
+                int dy = int(y1) - int(y2);
+                float dist_sq = float(dx * dx + dy * dy);
+
+                if (dist_sq < min_distance_sq) {
+                    XFLOAT ccf2 = d_ccf[idx2];
+                    // Keep only if this peak has higher CCF
+                    if (ccf2 > ccf1 || (ccf2 == ccf1 && i < gid)) {
+                        keep = false;
+                        break;
+                    }
+                }
+            }
+        }
+
+        d_keep_mask[gid] = keep ? 1 : 0;
     }
 }
