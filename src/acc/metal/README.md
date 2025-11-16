@@ -4,9 +4,9 @@
 
 This directory contains the Metal GPU acceleration backend for RELION, enabling native GPU support on Apple Silicon (M-Series) Macs.
 
-**Status:** Phase 3 - Advanced Features & Host Integration (COMPLETE)
+**Status:** Phase 4 - Production Readiness & Dispatcher Integration (IN PROGRESS)
 
-**Implementation Date:** 2025-11-15 (Phase 1), 2025-11-15 (Phase 2A), 2025-11-16 (Phase 2B/3 COMPLETE)
+**Implementation Date:** 2025-11-15 (Phase 1), 2025-11-15 (Phase 2A), 2025-11-16 (Phase 2B/3/4 IN PROGRESS)
 
 ## Architecture
 
@@ -39,6 +39,7 @@ src/acc/metal/
 ├── metal_kernel_utils.h/.mm        # Kernel launcher infrastructure
 ├── metal_fft.h/.mm                 # GPU-accelerated FFT (Cooley-Tukey algorithm)
 ├── metal_kernels.h/.mm             # Host integration wrapper functions
+├── metal_kernels_impl.h            # Template wrapper layer for dispatchers
 ├── metal_kernels/
 │   ├── helper.metal                # Common MSL utility functions
 │   ├── utilities.metal             # Basic utility kernels + auto-picker

@@ -89,11 +89,10 @@ static id<MTLBuffer> createProjectorParamsBuffer(AccProjectorKernel &projector) 
 }
 
 // ============================================================================
-// diff2_coarse Implementation
+// diff2_coarse Implementation (non-template version for dispatcher)
 // ============================================================================
 
-template<bool REF3D, bool DATA3D>
-void diff2_coarse(
+void diff2_coarse_impl(
     unsigned long grid_size,
     int block_size,
     XFLOAT *g_eulers,
@@ -104,21 +103,26 @@ void diff2_coarse(
     XFLOAT *g_imag,
     XFLOAT *mdlReal,
     XFLOAT *mdlImag,
-    AccProjectorKernel &projector,
+    int mdlX, int mdlXY, int mdlZ,
+    int imgX, int imgY, int imgZ,
+    int mdlInitY, int mdlInitZ,
+    int maxR, int maxR2,
+    XFLOAT padding_factor,
     XFLOAT *g_corr,
     XFLOAT *g_diff2s,
     unsigned long translation_num,
     unsigned long image_size,
     int eulers_per_block,
     int prefetch_fraction,
+    bool is_3D,
     deviceStream_t stream)
 {
     @autoreleasepool {
         initMetalIfNeeded();
 
         // Select kernel based on dimensionality
-        const char* kernelName = DATA3D ? "metal_kernel_diff2_coarse_3D"
-                                         : "metal_kernel_diff2_coarse_2D";
+        const char* kernelName = is_3D ? "metal_kernel_diff2_coarse_3D"
+                                        : "metal_kernel_diff2_coarse_2D";
         id<MTLComputePipelineState> pipeline = getPipeline(kernelName);
 
         id<MTLCommandBuffer> cmdBuffer = [g_queue commandBuffer];
@@ -131,45 +135,60 @@ void diff2_coarse(
         [encoder setBuffer:(__bridge id<MTLBuffer>)trans_x offset:0 atIndex:1];
         [encoder setBuffer:(__bridge id<MTLBuffer>)trans_y offset:0 atIndex:2];
 
-        if (DATA3D) {
+        if (is_3D) {
             [encoder setBuffer:(__bridge id<MTLBuffer>)trans_z offset:0 atIndex:3];
             [encoder setBuffer:(__bridge id<MTLBuffer>)g_real offset:0 atIndex:4];
             [encoder setBuffer:(__bridge id<MTLBuffer>)g_imag offset:0 atIndex:5];
             [encoder setBuffer:(__bridge id<MTLBuffer>)mdlReal offset:0 atIndex:6];
             [encoder setBuffer:(__bridge id<MTLBuffer>)mdlImag offset:0 atIndex:7];
 
-            id<MTLBuffer> projParams = createProjectorParamsBuffer(projector);
-            [encoder setBuffer:projParams offset:0 atIndex:8];
+            // Projector params as constants
+            [encoder setBytes:&mdlX length:sizeof(int) atIndex:8];
+            [encoder setBytes:&mdlXY length:sizeof(int) atIndex:9];
+            [encoder setBytes:&mdlZ length:sizeof(int) atIndex:10];
+            [encoder setBytes:&imgX length:sizeof(int) atIndex:11];
+            [encoder setBytes:&imgY length:sizeof(int) atIndex:12];
+            [encoder setBytes:&imgZ length:sizeof(int) atIndex:13];
+            [encoder setBytes:&mdlInitY length:sizeof(int) atIndex:14];
+            [encoder setBytes:&mdlInitZ length:sizeof(int) atIndex:15];
+            [encoder setBytes:&maxR length:sizeof(int) atIndex:16];
+            [encoder setBytes:&maxR2 length:sizeof(int) atIndex:17];
+            [encoder setBytes:&padding_factor length:sizeof(XFLOAT) atIndex:18];
 
-            [encoder setBuffer:(__bridge id<MTLBuffer>)g_corr offset:0 atIndex:9];
-            [encoder setBuffer:(__bridge id<MTLBuffer>)g_diff2s offset:0 atIndex:10];
+            [encoder setBuffer:(__bridge id<MTLBuffer>)g_corr offset:0 atIndex:19];
+            [encoder setBuffer:(__bridge id<MTLBuffer>)g_diff2s offset:0 atIndex:20];
 
             int trans_num = (int)translation_num;
             int img_size = (int)image_size;
-            [encoder setBytes:&trans_num length:sizeof(int) atIndex:11];
-            [encoder setBytes:&img_size length:sizeof(int) atIndex:12];
-            [encoder setBytes:&eulers_per_block length:sizeof(int) atIndex:13];
-            [encoder setBytes:&block_size length:sizeof(int) atIndex:14];
-            [encoder setBytes:&prefetch_fraction length:sizeof(int) atIndex:15];
+            [encoder setBytes:&trans_num length:sizeof(int) atIndex:21];
+            [encoder setBytes:&img_size length:sizeof(int) atIndex:22];
+            [encoder setBytes:&eulers_per_block length:sizeof(int) atIndex:23];
+            [encoder setBytes:&prefetch_fraction length:sizeof(int) atIndex:24];
         } else {
             [encoder setBuffer:(__bridge id<MTLBuffer>)g_real offset:0 atIndex:3];
             [encoder setBuffer:(__bridge id<MTLBuffer>)g_imag offset:0 atIndex:4];
             [encoder setBuffer:(__bridge id<MTLBuffer>)mdlReal offset:0 atIndex:5];
             [encoder setBuffer:(__bridge id<MTLBuffer>)mdlImag offset:0 atIndex:6];
 
-            id<MTLBuffer> projParams = createProjectorParamsBuffer(projector);
-            [encoder setBuffer:projParams offset:0 atIndex:7];
+            // Projector params
+            [encoder setBytes:&mdlX length:sizeof(int) atIndex:7];
+            [encoder setBytes:&mdlXY length:sizeof(int) atIndex:8];
+            [encoder setBytes:&imgX length:sizeof(int) atIndex:9];
+            [encoder setBytes:&imgY length:sizeof(int) atIndex:10];
+            [encoder setBytes:&mdlInitY length:sizeof(int) atIndex:11];
+            [encoder setBytes:&maxR length:sizeof(int) atIndex:12];
+            [encoder setBytes:&maxR2 length:sizeof(int) atIndex:13];
+            [encoder setBytes:&padding_factor length:sizeof(XFLOAT) atIndex:14];
 
-            [encoder setBuffer:(__bridge id<MTLBuffer>)g_corr offset:0 atIndex:8];
-            [encoder setBuffer:(__bridge id<MTLBuffer>)g_diff2s offset:0 atIndex:9];
+            [encoder setBuffer:(__bridge id<MTLBuffer>)g_corr offset:0 atIndex:15];
+            [encoder setBuffer:(__bridge id<MTLBuffer>)g_diff2s offset:0 atIndex:16];
 
             int trans_num = (int)translation_num;
             int img_size = (int)image_size;
-            [encoder setBytes:&trans_num length:sizeof(int) atIndex:10];
-            [encoder setBytes:&img_size length:sizeof(int) atIndex:11];
-            [encoder setBytes:&eulers_per_block length:sizeof(int) atIndex:12];
-            [encoder setBytes:&block_size length:sizeof(int) atIndex:13];
-            [encoder setBytes:&prefetch_fraction length:sizeof(int) atIndex:14];
+            [encoder setBytes:&trans_num length:sizeof(int) atIndex:17];
+            [encoder setBytes:&img_size length:sizeof(int) atIndex:18];
+            [encoder setBytes:&eulers_per_block length:sizeof(int) atIndex:19];
+            [encoder setBytes:&prefetch_fraction length:sizeof(int) atIndex:20];
         }
 
         // Calculate shared memory size
@@ -190,17 +209,11 @@ void diff2_coarse(
     }
 }
 
-// Explicit template instantiations
-template void diff2_coarse<false, false>(unsigned long, int, XFLOAT*, XFLOAT*, XFLOAT*, XFLOAT*, XFLOAT*, XFLOAT*, XFLOAT*, XFLOAT*, AccProjectorKernel&, XFLOAT*, XFLOAT*, unsigned long, unsigned long, int, int, deviceStream_t);
-template void diff2_coarse<true, false>(unsigned long, int, XFLOAT*, XFLOAT*, XFLOAT*, XFLOAT*, XFLOAT*, XFLOAT*, XFLOAT*, XFLOAT*, AccProjectorKernel&, XFLOAT*, XFLOAT*, unsigned long, unsigned long, int, int, deviceStream_t);
-template void diff2_coarse<true, true>(unsigned long, int, XFLOAT*, XFLOAT*, XFLOAT*, XFLOAT*, XFLOAT*, XFLOAT*, XFLOAT*, XFLOAT*, AccProjectorKernel&, XFLOAT*, XFLOAT*, unsigned long, unsigned long, int, int, deviceStream_t);
-
 // ============================================================================
-// diff2_fine Implementation
+// diff2_fine Implementation (non-template version for dispatcher)
 // ============================================================================
 
-template<bool REF3D, bool DATA3D>
-void diff2_fine(
+void diff2_fine_impl(
     unsigned long grid_size,
     int block_size,
     XFLOAT *g_eulers,
@@ -211,7 +224,11 @@ void diff2_fine(
     XFLOAT *trans_z,
     XFLOAT *mdlReal,
     XFLOAT *mdlImag,
-    AccProjectorKernel &projector,
+    int mdlX, int mdlXY, int mdlZ,
+    int imgX, int imgY, int imgZ,
+    int mdlInitY, int mdlInitZ,
+    int maxR, int maxR2,
+    XFLOAT padding_factor,
     XFLOAT *g_corr_img,
     XFLOAT *g_diff2s,
     unsigned long image_size,
@@ -224,13 +241,14 @@ void diff2_fine(
     unsigned long *d_job_idx,
     unsigned long *d_job_num,
     int chunk_sz,
+    bool is_3D,
     deviceStream_t stream)
 {
     @autoreleasepool {
         initMetalIfNeeded();
 
-        const char* kernelName = DATA3D ? "metal_kernel_diff2_fine_3D"
-                                         : "metal_kernel_diff2_fine_2D";
+        const char* kernelName = is_3D ? "metal_kernel_diff2_fine_3D"
+                                        : "metal_kernel_diff2_fine_2D";
         id<MTLComputePipelineState> pipeline = getPipeline(kernelName);
 
         id<MTLCommandBuffer> cmdBuffer = [g_queue commandBuffer];
@@ -246,15 +264,25 @@ void diff2_fine(
         [encoder setBuffer:(__bridge id<MTLBuffer>)trans_x offset:0 atIndex:bufIdx++];
         [encoder setBuffer:(__bridge id<MTLBuffer>)trans_y offset:0 atIndex:bufIdx++];
 
-        if (DATA3D) {
+        if (is_3D) {
             [encoder setBuffer:(__bridge id<MTLBuffer>)trans_z offset:0 atIndex:bufIdx++];
         }
 
         [encoder setBuffer:(__bridge id<MTLBuffer>)mdlReal offset:0 atIndex:bufIdx++];
         [encoder setBuffer:(__bridge id<MTLBuffer>)mdlImag offset:0 atIndex:bufIdx++];
 
-        id<MTLBuffer> projParams = createProjectorParamsBuffer(projector);
-        [encoder setBuffer:projParams offset:0 atIndex:bufIdx++];
+        // Projector params
+        [encoder setBytes:&mdlX length:sizeof(int) atIndex:bufIdx++];
+        [encoder setBytes:&mdlXY length:sizeof(int) atIndex:bufIdx++];
+        [encoder setBytes:&mdlZ length:sizeof(int) atIndex:bufIdx++];
+        [encoder setBytes:&imgX length:sizeof(int) atIndex:bufIdx++];
+        [encoder setBytes:&imgY length:sizeof(int) atIndex:bufIdx++];
+        [encoder setBytes:&imgZ length:sizeof(int) atIndex:bufIdx++];
+        [encoder setBytes:&mdlInitY length:sizeof(int) atIndex:bufIdx++];
+        [encoder setBytes:&mdlInitZ length:sizeof(int) atIndex:bufIdx++];
+        [encoder setBytes:&maxR length:sizeof(int) atIndex:bufIdx++];
+        [encoder setBytes:&maxR2 length:sizeof(int) atIndex:bufIdx++];
+        [encoder setBytes:&padding_factor length:sizeof(XFLOAT) atIndex:bufIdx++];
 
         [encoder setBuffer:(__bridge id<MTLBuffer>)g_corr_img offset:0 atIndex:bufIdx++];
         [encoder setBuffer:(__bridge id<MTLBuffer>)g_diff2s offset:0 atIndex:bufIdx++];
@@ -289,11 +317,6 @@ void diff2_fine(
         [cmdBuffer waitUntilCompleted];
     }
 }
-
-// Explicit template instantiations
-template void diff2_fine<false, false>(unsigned long, int, XFLOAT*, XFLOAT*, XFLOAT*, XFLOAT*, XFLOAT*, XFLOAT*, XFLOAT*, XFLOAT*, AccProjectorKernel&, XFLOAT*, XFLOAT*, unsigned long, XFLOAT, unsigned long, unsigned long, unsigned long, unsigned long*, unsigned long*, unsigned long*, unsigned long*, int, deviceStream_t);
-template void diff2_fine<true, false>(unsigned long, int, XFLOAT*, XFLOAT*, XFLOAT*, XFLOAT*, XFLOAT*, XFLOAT*, XFLOAT*, XFLOAT*, AccProjectorKernel&, XFLOAT*, XFLOAT*, unsigned long, XFLOAT, unsigned long, unsigned long, unsigned long, unsigned long*, unsigned long*, unsigned long*, unsigned long*, int, deviceStream_t);
-template void diff2_fine<true, true>(unsigned long, int, XFLOAT*, XFLOAT*, XFLOAT*, XFLOAT*, XFLOAT*, XFLOAT*, XFLOAT*, XFLOAT*, AccProjectorKernel&, XFLOAT*, XFLOAT*, unsigned long, XFLOAT, unsigned long, unsigned long, unsigned long, unsigned long*, unsigned long*, unsigned long*, unsigned long*, int, deviceStream_t);
 
 // ============================================================================
 // Backprojection Implementations

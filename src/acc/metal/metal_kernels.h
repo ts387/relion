@@ -14,41 +14,34 @@ namespace MetalKernels {
 // ============================================================================
 
 // diff2_coarse - Multiple orientations per block
-template<bool REF3D, bool DATA3D>
-void diff2_coarse(
+// Template parameters match SYCL/CUDA pattern for dispatcher compatibility
+template<bool REF3D, bool DATA3D, int block_sz, int eulers_per_block, int prefetch_fraction>
+inline void diff2_coarse(
     unsigned long grid_size,
-    int block_size,
     XFLOAT *g_eulers,
     XFLOAT *trans_x,
     XFLOAT *trans_y,
     XFLOAT *trans_z,
     XFLOAT *g_real,
     XFLOAT *g_imag,
-    XFLOAT *mdlReal,
-    XFLOAT *mdlImag,
-    AccProjectorKernel &projector,
+    AccProjectorKernel projector,
     XFLOAT *g_corr,
     XFLOAT *g_diff2s,
     unsigned long translation_num,
     unsigned long image_size,
-    int eulers_per_block,
-    int prefetch_fraction,
     deviceStream_t stream);
 
 // diff2_fine - Single orientation per block with dynamic scheduling
-template<bool REF3D, bool DATA3D>
-void diff2_fine(
+template<bool REF3D, bool DATA3D, int block_sz, int chunk_sz>
+inline void diff2_fine(
     unsigned long grid_size,
-    int block_size,
     XFLOAT *g_eulers,
     XFLOAT *g_imgs_real,
     XFLOAT *g_imgs_imag,
     XFLOAT *trans_x,
     XFLOAT *trans_y,
     XFLOAT *trans_z,
-    XFLOAT *mdlReal,
-    XFLOAT *mdlImag,
-    AccProjectorKernel &projector,
+    AccProjectorKernel projector,
     XFLOAT *g_corr_img,
     XFLOAT *g_diff2s,
     unsigned long image_size,
@@ -60,7 +53,6 @@ void diff2_fine(
     unsigned long *d_trans_idx,
     unsigned long *d_job_idx,
     unsigned long *d_job_num,
-    int chunk_sz,
     deviceStream_t stream);
 
 // ============================================================================

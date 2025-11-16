@@ -29,7 +29,10 @@ class AccProjector
 	deviceStream_t devAcc;
 #endif
 
-#ifndef PROJECTOR_NO_TEXTURES
+#ifdef _METAL_ENABLED
+	XFLOAT *mdlReal;
+	XFLOAT *mdlImag;
+#elif !defined(PROJECTOR_NO_TEXTURES)
 
 	XFLOAT *texArrayReal2D, *texArrayImag2D;
 	#ifdef _CUDA_ENABLED
@@ -37,7 +40,7 @@ class AccProjector
 		cudaTextureObject_t *mdlReal, *mdlImag;
 	#elif _HIP_ENABLED
 		hipArray_t *texArrayReal, *texArrayImag;
-		hipTextureObject_t *mdlReal, *mdlImag;	
+		hipTextureObject_t *mdlReal, *mdlImag;
 	#endif
 	size_t pitch2D;
 #else
@@ -60,7 +63,10 @@ public:
 #ifdef _SYCL_ENABLED
 		devAcc = nullptr;
 #endif
-#ifndef PROJECTOR_NO_TEXTURES
+#ifdef _METAL_ENABLED
+		mdlReal = 0;
+		mdlImag = 0;
+#elif !defined(PROJECTOR_NO_TEXTURES)
 
 		texArrayReal2D = 0;
 		texArrayImag2D = 0;
@@ -85,7 +91,7 @@ public:
 			int inity, int initz,
 			int maxr, XFLOAT paddingFactor);
 
-#if defined(_CUDA_ENABLED) || defined(_HIP_ENABLED)
+#if defined(_CUDA_ENABLED) || defined(_HIP_ENABLED) || defined(_METAL_ENABLED)
 	void initMdl(XFLOAT *real, XFLOAT *imag);
 #endif
 #ifdef ALTCPU

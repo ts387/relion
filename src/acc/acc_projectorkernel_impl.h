@@ -25,6 +25,9 @@ public:
 #if defined _CUDA_ENABLED || defined _HIP_ENABLED
 	PROJECTOR_PTR_TYPE mdlReal;
 	PROJECTOR_PTR_TYPE mdlImag;
+#elif defined _METAL_ENABLED
+	XFLOAT *mdlReal;
+	XFLOAT *mdlImag;
 #elif _SYCL_ENABLED
 	PROJECTOR_PTR_TYPE mdlComplex;
 #else
@@ -39,6 +42,22 @@ public:
 			XFLOAT padding_factor,
 			int maxR,
 			PROJECTOR_PTR_TYPE mdlReal, PROJECTOR_PTR_TYPE mdlImag
+			):
+				mdlX(mdlX), mdlXY(mdlX*mdlY), mdlZ(mdlZ),
+				imgX(imgX), imgY(imgY), imgZ(imgZ),
+				mdlInitY(mdlInitY), mdlInitZ(mdlInitZ),
+				padding_factor(padding_factor),
+				maxR(maxR), maxR2(maxR*maxR), maxR2_padded(maxR*maxR*padding_factor*padding_factor),
+				mdlReal(mdlReal), mdlImag(mdlImag)
+		{};
+#elif defined _METAL_ENABLED
+	AccProjectorKernel(
+			int mdlX, int mdlY, int mdlZ,
+			int imgX, int imgY, int imgZ,
+			int mdlInitY, int mdlInitZ,
+			XFLOAT padding_factor,
+			int maxR,
+			XFLOAT *mdlReal, XFLOAT *mdlImag
 			):
 				mdlX(mdlX), mdlXY(mdlX*mdlY), mdlZ(mdlZ),
 				imgX(imgX), imgY(imgY), imgZ(imgZ),
@@ -111,6 +130,10 @@ public:
 #if defined _CUDA_ENABLED || defined _HIP_ENABLED
 			real =   no_tex3D(mdlReal, xp, yp, zp, mdlX, mdlXY, mdlInitY, mdlInitZ);
 			imag = - no_tex3D(mdlImag, xp, yp, zp, mdlX, mdlXY, mdlInitY, mdlInitZ);
+#elif defined _METAL_ENABLED
+			// Metal uses buffer-based interpolation (handled in Metal shaders)
+			real = (XFLOAT)0;
+			imag = (XFLOAT)0;
 #elif _SYCL_ENABLED
 			syclKernels::no_tex3D(mdlComplex, real, imag, xp, yp, zp, mdlX, mdlXY, mdlInitY, mdlInitZ);
 			imag = -imag;
@@ -191,6 +214,10 @@ public:
 	#if defined _CUDA_ENABLED || defined _HIP_ENABLED
 			real = no_tex3D(mdlReal, xp, yp, zp, mdlX, mdlXY, mdlInitY, mdlInitZ);
 			imag = no_tex3D(mdlImag, xp, yp, zp, mdlX, mdlXY, mdlInitY, mdlInitZ);
+	#elif defined _METAL_ENABLED
+			// Metal uses buffer-based interpolation (handled in Metal shaders)
+			real = (XFLOAT)0;
+			imag = (XFLOAT)0;
 	#elif _SYCL_ENABLED
 			syclKernels::no_tex3D(mdlComplex, real, imag, xp, yp, zp, mdlX, mdlXY, mdlInitY, mdlInitZ);
 	#else
@@ -263,6 +290,10 @@ __device__ __forceinline__
 	#if defined _CUDA_ENABLED || defined _HIP_ENABLED
 			real = no_tex2D(mdlReal, xp, yp, mdlX, mdlInitY);
 			imag = no_tex2D(mdlImag, xp, yp, mdlX, mdlInitY);
+	#elif defined _METAL_ENABLED
+			// Metal uses buffer-based interpolation (handled in Metal shaders)
+			real = (XFLOAT)0;
+			imag = (XFLOAT)0;
 	#elif _SYCL_ENABLED
 			syclKernels::no_tex2D(mdlComplex, real, imag, xp, yp, mdlX, mdlInitY);
 	#else
@@ -308,7 +339,10 @@ __device__ __forceinline__
 					p.mdlInitY, p.mdlInitZ,
 					p.padding_factor,
 					maxR,
-#ifndef PROJECTOR_NO_TEXTURES
+#if defined _METAL_ENABLED
+					p.mdlReal,
+					p.mdlImag
+#elif !defined PROJECTOR_NO_TEXTURES
 					*p.mdlReal,
 					*p.mdlImag
 #else

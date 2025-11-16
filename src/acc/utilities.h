@@ -24,6 +24,10 @@ using deviceStream_t = hipStream_t;
 #include "src/acc/sycl/sycl_kernels/wavg.h"
 #include "src/acc/sycl/sycl_kernels/diff2.h"
 #include "src/acc/sycl/device_stubs.h"
+#elif _METAL_ENABLED
+#include "src/acc/metal/metal_kernels_impl.h"
+#include "src/acc/metal/device_stubs.h"
+using deviceStream_t = void*;
 #else
 #include <algorithm>
 #include <iterator>
@@ -1141,6 +1145,22 @@ void diff2_coarse(
 			image_size,
 			stream
 	);
+#elif _METAL_ENABLED
+	MetalKernels::diff2_coarse<REF3D, DATA3D, block_sz, eulers_per_block, prefetch_fraction>(
+			grid_size,
+			g_eulers,
+			trans_x,
+			trans_y,
+			trans_z,
+			g_real,
+			g_imag,
+			projector,
+			g_corr,
+			g_diff2s,
+			translation_num,
+			image_size,
+			stream
+	);
 #else
 	CpuKernels::diff2_coarse<REF3D, DATA3D, block_sz, eulers_per_block, prefetch_fraction>(
 			grid_size,
@@ -1330,6 +1350,28 @@ void diff2_fine(
 					d_job_num);
 #elif _SYCL_ENABLED
 	syclKernels::diff2_fine<REF3D,DATA3D, block_sz, chunk_sz>(
+		grid_size,
+		g_eulers,
+		g_imgs_real,
+		g_imgs_imag,
+		trans_x,
+		trans_y,
+		trans_z,
+		projector,
+		g_corr_img,    // in these non-CC kernels this is effectively an adjusted MinvSigma2
+		g_diff2s,
+		image_size,
+		sum_init,
+		orientation_num,
+		translation_num,
+		todo_blocks, //significant_num,
+		d_rot_idx,
+		d_trans_idx,
+		d_job_idx,
+		d_job_num,
+		stream);
+#elif _METAL_ENABLED
+	MetalKernels::diff2_fine<REF3D,DATA3D, block_sz, chunk_sz>(
 		grid_size,
 		g_eulers,
 		g_imgs_real,
