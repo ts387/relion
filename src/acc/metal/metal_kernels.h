@@ -221,6 +221,14 @@ void generateNormalDistribution3D(
     unsigned long zdim,
     deviceStream_t stream);
 
+// ============================================================================
+// Performance Profiling API
+// ============================================================================
+
+// Print profiling report (call at end of processing)
+// Enable profiling by setting RELION_METAL_PROFILING=1 environment variable
+void printProfilingReport();
+
 } // namespace MetalKernels
 
 #endif // _METAL_ENABLED

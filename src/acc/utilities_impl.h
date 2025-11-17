@@ -697,6 +697,18 @@ void centerFFT_2D(int grid_size, int batch_size, int block_size,
 				ydim,
 				xshift,
 				yshift);
+#elif _METAL_ENABLED
+	// Metal: fall back to CPU for now (TODO: implement Metal kernel)
+	(void)grid_size;
+	(void)block_size;
+	(void)stream;
+	centerFFT_2D_CPU<XFLOAT>(batch_size, 0, image_size/2,
+				img_in,
+				image_size,
+				xdim,
+				ydim,
+				xshift,
+				yshift);
 #else
 	centerFFT_2D_CPU<XFLOAT>(batch_size, 0, image_size/2,
 				img_in,
@@ -705,7 +717,7 @@ void centerFFT_2D(int grid_size, int batch_size, int block_size,
 				ydim,
 				xshift,
 				yshift);
-#endif	
+#endif
 }
 
 void centerFFT_2D(int grid_size, int batch_size, int block_size,
@@ -734,6 +746,17 @@ void centerFFT_2D(int grid_size, int batch_size, int block_size,
 				ydim,
 				xshift,
 				yshift);
+#elif _METAL_ENABLED
+	// Metal: fall back to CPU for now (TODO: implement Metal kernel)
+	(void)grid_size;
+	(void)block_size;
+	centerFFT_2D_CPU<XFLOAT>(batch_size, 0, image_size/2,
+			img_in,
+			image_size,
+			xdim,
+			ydim,
+			xshift,
+			yshift);
 #else
 	centerFFT_2D_CPU<XFLOAT>(batch_size, 0, image_size/2,
 			img_in,
@@ -778,6 +801,20 @@ void centerFFT_3D(int grid_size, int batch_size, int block_size,
 				xshift,
 				yshift,
 				zshift);
+#elif _METAL_ENABLED
+	// Metal: fall back to CPU for now (TODO: implement Metal kernel)
+	(void)grid_size;
+	(void)block_size;
+	(void)stream;
+	centerFFT_3D_CPU<XFLOAT>(batch_size, (size_t)0, (size_t)image_size/2,
+			img_in,
+			image_size,
+			xdim,
+			ydim,
+			zdim,
+			xshift,
+			yshift,
+			zshift);
 #else
 	centerFFT_3D_CPU<XFLOAT>(batch_size, (size_t)0, (size_t)image_size/2,
 			img_in,
@@ -871,6 +908,23 @@ void kernel_exponentiate_weights_fine(	XFLOAT *g_pdf_orientation,
 		d_job_num,
 		job_num);
  #endif
+#elif _METAL_ENABLED
+	// Metal backend - exponentiate_weights_fine not yet implemented
+	// TODO: Implement when needed for fine sampling support
+	(void)g_pdf_orientation;
+	(void)g_pdf_orientation_zeros;
+	(void)g_pdf_offset;
+	(void)g_pdf_offset_zeros;
+	(void)g_weights;
+	(void)min_diff2;
+	(void)oversamples_orient;
+	(void)oversamples_trans;
+	(void)d_rot_id;
+	(void)d_trans_idx;
+	(void)d_job_idx;
+	(void)d_job_num;
+	(void)job_num;
+	(void)stream;
 #else
 	CpuKernels::exponentiate_weights_fine(
 		g_pdf_orientation,

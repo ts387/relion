@@ -3,10 +3,103 @@
 #import "src/acc/metal/metal_kernel_utils.h"
 #import <Metal/Metal.h>
 #import <Foundation/Foundation.h>
+#import <mach/mach_time.h>
 
 #ifdef _METAL_ENABLED
 
 namespace MetalKernels {
+
+// ============================================================================
+// Performance Profiling Infrastructure
+// ============================================================================
+
+struct KernelProfileData {
+    uint64_t total_time_ns;
+    uint64_t call_count;
+    uint64_t min_time_ns;
+    uint64_t max_time_ns;
+};
+
+static NSMutableDictionary<NSString*, NSValue*>* g_profile_data = nil;
+static bool g_profiling_enabled = false;
+static mach_timebase_info_data_t g_timebase_info;
+static bool g_timebase_initialized = false;
+
+static void initProfilingIfNeeded() {
+    static bool initialized = false;
+    if (!initialized) {
+        const char* env = getenv("RELION_METAL_PROFILING");
+        g_profiling_enabled = (env != nullptr && strcmp(env, "1") == 0);
+
+        if (g_profiling_enabled) {
+            g_profile_data = [[NSMutableDictionary alloc] init];
+            mach_timebase_info(&g_timebase_info);
+            g_timebase_initialized = true;
+            fprintf(stderr, "Metal PROFILING: Enabled. Set RELION_METAL_PROFILING=0 to disable.\n");
+        }
+        initialized = true;
+    }
+}
+
+static uint64_t getCurrentTimeNs() {
+    if (!g_timebase_initialized) {
+        mach_timebase_info(&g_timebase_info);
+        g_timebase_initialized = true;
+    }
+    uint64_t mach_time = mach_absolute_time();
+    return mach_time * g_timebase_info.numer / g_timebase_info.denom;
+}
+
+static void recordKernelTime(const char* kernelName, uint64_t elapsed_ns) {
+    if (!g_profiling_enabled) return;
+
+    NSString* name = [NSString stringWithUTF8String:kernelName];
+    NSValue* existingValue = g_profile_data[name];
+
+    KernelProfileData data;
+    if (existingValue) {
+        [existingValue getValue:&data];
+        data.total_time_ns += elapsed_ns;
+        data.call_count++;
+        if (elapsed_ns < data.min_time_ns) data.min_time_ns = elapsed_ns;
+        if (elapsed_ns > data.max_time_ns) data.max_time_ns = elapsed_ns;
+    } else {
+        data.total_time_ns = elapsed_ns;
+        data.call_count = 1;
+        data.min_time_ns = elapsed_ns;
+        data.max_time_ns = elapsed_ns;
+    }
+
+    g_profile_data[name] = [NSValue valueWithBytes:&data objCType:@encode(KernelProfileData)];
+}
+
+void printProfilingReport() {
+    if (!g_profiling_enabled || !g_profile_data) {
+        fprintf(stderr, "Metal PROFILING: No profiling data available.\n");
+        return;
+    }
+
+    fprintf(stderr, "\n=== Metal Kernel Profiling Report ===\n");
+    fprintf(stderr, "%-35s %10s %12s %12s %12s %12s\n",
+            "Kernel", "Calls", "Total(ms)", "Avg(ms)", "Min(ms)", "Max(ms)");
+    fprintf(stderr, "%-35s %10s %12s %12s %12s %12s\n",
+            "-----------------------------------", "----------", "------------",
+            "------------", "------------", "------------");
+
+    for (NSString* name in g_profile_data) {
+        KernelProfileData data;
+        [g_profile_data[name] getValue:&data];
+
+        double total_ms = data.total_time_ns / 1e6;
+        double avg_ms = total_ms / data.call_count;
+        double min_ms = data.min_time_ns / 1e6;
+        double max_ms = data.max_time_ns / 1e6;
+
+        fprintf(stderr, "%-35s %10llu %12.3f %12.3f %12.3f %12.3f\n",
+                [name UTF8String], data.call_count, total_ms, avg_ms, min_ms, max_ms);
+    }
+    fprintf(stderr, "======================================\n\n");
+}
 
 // Global Metal resources
 static id<MTLDevice> g_device = nil;
@@ -17,6 +110,8 @@ static NSMutableDictionary<NSString*, id<MTLComputePipelineState>>* g_pipelines 
 // Initialize Metal infrastructure
 static void initMetalIfNeeded() {
     if (g_device == nil) {
+        initProfilingIfNeeded();
+
         g_device = MTLCreateSystemDefaultDevice();
         if (!g_device) {
             CRITICAL(ERRGPUKERN);
@@ -119,6 +214,7 @@ void diff2_coarse_impl(
 {
     @autoreleasepool {
         initMetalIfNeeded();
+        uint64_t start_time = g_profiling_enabled ? getCurrentTimeNs() : 0;
 
         // Select kernel based on dimensionality
         const char* kernelName = is_3D ? "metal_kernel_diff2_coarse_3D"
@@ -206,6 +302,11 @@ void diff2_coarse_impl(
         [encoder endEncoding];
         [cmdBuffer commit];
         [cmdBuffer waitUntilCompleted];
+
+        if (g_profiling_enabled) {
+            uint64_t elapsed = getCurrentTimeNs() - start_time;
+            recordKernelTime(kernelName, elapsed);
+        }
     }
 }
 
@@ -246,6 +347,7 @@ void diff2_fine_impl(
 {
     @autoreleasepool {
         initMetalIfNeeded();
+        uint64_t start_time = g_profiling_enabled ? getCurrentTimeNs() : 0;
 
         const char* kernelName = is_3D ? "metal_kernel_diff2_fine_3D"
                                         : "metal_kernel_diff2_fine_2D";
@@ -315,6 +417,11 @@ void diff2_fine_impl(
         [encoder endEncoding];
         [cmdBuffer commit];
         [cmdBuffer waitUntilCompleted];
+
+        if (g_profiling_enabled) {
+            uint64_t elapsed = getCurrentTimeNs() - start_time;
+            recordKernelTime(kernelName, elapsed);
+        }
     }
 }
 
@@ -541,6 +648,7 @@ void exponentiate(
 {
     @autoreleasepool {
         initMetalIfNeeded();
+        uint64_t start_time = g_profiling_enabled ? getCurrentTimeNs() : 0;
 
         id<MTLComputePipelineState> pipeline = getPipeline("metal_kernel_exponentiate");
         id<MTLCommandBuffer> cmdBuffer = [g_queue commandBuffer];
@@ -561,6 +669,11 @@ void exponentiate(
         [encoder endEncoding];
         [cmdBuffer commit];
         [cmdBuffer waitUntilCompleted];
+
+        if (g_profiling_enabled) {
+            uint64_t elapsed = getCurrentTimeNs() - start_time;
+            recordKernelTime("exponentiate", elapsed);
+        }
     }
 }
 

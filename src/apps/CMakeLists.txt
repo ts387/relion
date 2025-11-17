@@ -389,6 +389,52 @@ elseif(SYCL)
 	endforeach()
 	target_link_libraries(relion_sycl_util sycl OpenCL relion_lib)
 
+elseif(METAL)
+    # Metal GPU acceleration library
+    file(GLOB REL_METAL_SRC "${CMAKE_SOURCE_DIR}/src/acc/metal/*.mm")
+    add_library(relion_metal_util ${REL_METAL_SRC})
+
+    # Set Objective-C++ language and ARC for Metal sources
+    set_source_files_properties(${REL_METAL_SRC} PROPERTIES
+        COMPILE_FLAGS "-x objective-c++ -fobjc-arc"
+    )
+
+    target_include_directories(relion_metal_util PRIVATE
+        ${CMAKE_SOURCE_DIR}
+        ${CMAKE_SOURCE_DIR}/src
+    )
+
+    target_compile_definitions(relion_metal_util PRIVATE
+        _METAL_ENABLED
+        PROJECTOR_NO_TEXTURES
+    )
+
+    # Handle circular dependencies on macOS
+    set(new_link_flags "-undefined suppress -flat_namespace")
+    get_target_property(existing_link_flags relion_metal_util LINK_FLAGS)
+    if(existing_link_flags)
+        set(new_link_flags "${existing_link_flags} ${new_link_flags}")
+    endif()
+    set_target_properties(relion_metal_util PROPERTIES LINK_FLAGS "${new_link_flags}")
+
+    # Link Metal frameworks
+    target_link_libraries(relion_metal_util
+        ${METAL_FRAMEWORK}
+        ${FOUNDATION_FRAMEWORK}
+        ${METALKIT_FRAMEWORK}
+        ${MPS_FRAMEWORK}
+        ${COREGRAPHICS_FRAMEWORK}
+        "-framework Accelerate"
+    )
+
+    if(BUILD_SHARED_LIBS)
+        install(TARGETS relion_metal_util LIBRARY DESTINATION lib)
+    else()
+        target_link_libraries(relion_metal_util relion_lib)
+    endif()
+
+    target_link_libraries(relion_lib relion_metal_util)
+
 endif()
 
 if(TIFF_FOUND)

@@ -1674,6 +1674,8 @@ void kernel_exponentiate(
 		syclGpuKernels::sycl_kernel_exponentiate<T>(array.getDevicePtr(), add, array.getSize(), array.getStream());
 	else
 		syclKernels::exponentiate<T>(~array, add, array.getSize());
+#elif _METAL_ENABLED
+	MetalKernels::exponentiate(~array, (XFLOAT)add, array.getSize(), array.getStream());
 #else
 	CpuKernels::exponentiate<T>	(~array, add, array.getSize());
 #endif
