@@ -4,6 +4,8 @@
 #import <Accelerate/Accelerate.h>
 #include <cstdio>
 #include <cmath>
+#include <cstring>
+#include <vector>
 
 namespace MetalFFT {
 
@@ -62,15 +64,26 @@ struct FFTPlanImpl {
     bool useCPUFallback;
     FFTSetup vdsp_setup;
 
+    // DFT setups for arbitrary sizes (non-power-of-2)
+    vDSP_DFT_Setup dft_forward;
+    vDSP_DFT_Setup dft_inverse;
+
     FFTPlanImpl() : library(nil), commandQueue(nil),
                     bitReversalPipeline(nil), butterflyPipeline(nil),
                     scalePipeline(nil), copyPipeline(nil),
                     tempReal(nil), tempImag(nil),
-                    useCPUFallback(false), vdsp_setup(nullptr) {}
+                    useCPUFallback(false), vdsp_setup(nullptr),
+                    dft_forward(nullptr), dft_inverse(nullptr) {}
 
     ~FFTPlanImpl() {
         if (vdsp_setup) {
             vDSP_destroy_fftsetup(vdsp_setup);
+        }
+        if (dft_forward) {
+            vDSP_DFT_DestroySetup(dft_forward);
+        }
+        if (dft_inverse) {
+            vDSP_DFT_DestroySetup(dft_inverse);
         }
     }
 
@@ -165,11 +178,16 @@ FFTPlan createFFTPlan1D(void* device, size_t nx, FFTType type, size_t batch) {
 
         // Check if we can use GPU FFT (requires power of 2)
         if (!isPowerOfTwo(nx)) {
-            fprintf(stderr, "Metal FFT WARNING: Non-power-of-2 size (%zu), using CPU fallback\n", nx);
+            fprintf(stderr, "Metal FFT INFO: Non-power-of-2 size (%zu), using vDSP DFT fallback\n", nx);
             plan->useCPUFallback = true;
-            plan->vdsp_setup = vDSP_create_fftsetup(plan->log2nx, FFT_RADIX2);
-            if (!plan->vdsp_setup) {
-                fprintf(stderr, "Metal FFT ERROR: Failed to create vDSP FFT setup\n");
+
+            // Create DFT setups for arbitrary-length transforms
+            // vDSP_DFT supports any length, not just power-of-2
+            plan->dft_forward = vDSP_DFT_zop_CreateSetup(nullptr, nx, vDSP_DFT_FORWARD);
+            plan->dft_inverse = vDSP_DFT_zop_CreateSetup(nullptr, nx, vDSP_DFT_INVERSE);
+
+            if (!plan->dft_forward || !plan->dft_inverse) {
+                fprintf(stderr, "Metal FFT ERROR: Failed to create vDSP DFT setup for size %zu\n", nx);
                 delete plan;
                 return nullptr;
             }
@@ -204,10 +222,20 @@ FFTPlan createFFTPlan2D(void* device, size_t nx, size_t ny, FFTType type, size_t
         plan->log2nz = 0;
 
         if (!isPowerOfTwo(nx) || !isPowerOfTwo(ny)) {
-            fprintf(stderr, "Metal FFT WARNING: Non-power-of-2 2D size (%zux%zu), using CPU fallback\n", nx, ny);
+            fprintf(stderr, "Metal FFT INFO: Non-power-of-2 2D size (%zux%zu), using vDSP DFT fallback\n", nx, ny);
             plan->useCPUFallback = true;
-            size_t max_log2 = (plan->log2nx > plan->log2ny) ? plan->log2nx : plan->log2ny;
-            plan->vdsp_setup = vDSP_create_fftsetup(max_log2, FFT_RADIX2);
+
+            // For 2D FFT, we'll do row and column FFTs separately
+            // Create DFT setup for the larger dimension (we'll reuse for both)
+            size_t maxDim = (nx > ny) ? nx : ny;
+            plan->dft_forward = vDSP_DFT_zop_CreateSetup(nullptr, maxDim, vDSP_DFT_FORWARD);
+            plan->dft_inverse = vDSP_DFT_zop_CreateSetup(nullptr, maxDim, vDSP_DFT_INVERSE);
+
+            if (!plan->dft_forward || !plan->dft_inverse) {
+                fprintf(stderr, "Metal FFT ERROR: Failed to create vDSP DFT setup for 2D size %zux%zu\n", nx, ny);
+                delete plan;
+                return nullptr;
+            }
         } else {
             plan->useCPUFallback = false;
             if (!plan->initializePipelines()) {
@@ -239,13 +267,24 @@ FFTPlan createFFTPlan3D(void* device, size_t nx, size_t ny, size_t nz, FFTType t
         plan->log2nz = computeLog2(nz);
 
         if (!isPowerOfTwo(nx) || !isPowerOfTwo(ny) || !isPowerOfTwo(nz)) {
-            fprintf(stderr, "Metal FFT WARNING: Non-power-of-2 3D size (%zux%zux%zu), using CPU fallback\n",
+            fprintf(stderr, "Metal FFT INFO: Non-power-of-2 3D size (%zux%zux%zu), using vDSP DFT fallback\n",
                     nx, ny, nz);
             plan->useCPUFallback = true;
+
+            // Create DFT setup for the largest dimension
             size_t max_dim = nx;
             if (ny > max_dim) max_dim = ny;
             if (nz > max_dim) max_dim = nz;
-            plan->vdsp_setup = vDSP_create_fftsetup(computeLog2(max_dim), FFT_RADIX2);
+
+            plan->dft_forward = vDSP_DFT_zop_CreateSetup(nullptr, max_dim, vDSP_DFT_FORWARD);
+            plan->dft_inverse = vDSP_DFT_zop_CreateSetup(nullptr, max_dim, vDSP_DFT_INVERSE);
+
+            if (!plan->dft_forward || !plan->dft_inverse) {
+                fprintf(stderr, "Metal FFT ERROR: Failed to create vDSP DFT setup for 3D size %zux%zux%zu\n",
+                        nx, ny, nz);
+                delete plan;
+                return nullptr;
+            }
         } else {
             plan->useCPUFallback = false;
             if (!plan->initializePipelines()) {
@@ -269,6 +308,256 @@ void destroyFFTPlan(FFTPlan plan) {
         FFTPlanImpl* impl = (FFTPlanImpl*)plan;
         delete impl;
     }
+}
+
+// ============================================================================
+// CPU Fallback FFT using vDSP for non-power-of-2 sizes
+// ============================================================================
+
+// Execute 1D DFT on CPU for non-power-of-2 sizes
+static void execute1DCPUFFT(FFTPlanImpl* impl,
+                            id<MTLBuffer> inReal, id<MTLBuffer> inImag,
+                            id<MTLBuffer> outReal, id<MTLBuffer> outImag,
+                            FFTDirection direction) {
+    size_t n = impl->nx;
+
+    // Get pointers to buffer contents (shared memory allows CPU access)
+    float* srcReal = (float*)inReal.contents;
+    float* srcImag = (float*)inImag.contents;
+    float* dstReal = (float*)outReal.contents;
+    float* dstImag = (float*)outImag.contents;
+
+    if (!srcReal || !srcImag || !dstReal || !dstImag) {
+        fprintf(stderr, "Metal FFT ERROR: Buffer contents not accessible for CPU FFT\n");
+        return;
+    }
+
+    // Select the appropriate DFT setup
+    vDSP_DFT_Setup dftSetup = (direction == FFT_FORWARD) ? impl->dft_forward : impl->dft_inverse;
+
+    // Process each batch
+    for (size_t b = 0; b < impl->batch; b++) {
+        size_t offset = b * n;
+
+        // Execute the DFT
+        vDSP_DFT_Execute(dftSetup,
+                         srcReal + offset, srcImag + offset,
+                         dstReal + offset, dstImag + offset);
+
+        // Scale for inverse FFT (vDSP doesn't auto-scale)
+        if (direction == FFT_INVERSE) {
+            float scale = 1.0f / (float)n;
+            vDSP_vsmul(dstReal + offset, 1, &scale, dstReal + offset, 1, n);
+            vDSP_vsmul(dstImag + offset, 1, &scale, dstImag + offset, 1, n);
+        }
+    }
+}
+
+// Execute 2D DFT on CPU (row-column decomposition)
+static void execute2DCPUFFT(FFTPlanImpl* impl,
+                            id<MTLBuffer> inReal, id<MTLBuffer> inImag,
+                            id<MTLBuffer> outReal, id<MTLBuffer> outImag,
+                            FFTDirection direction) {
+    size_t nx = impl->nx;
+    size_t ny = impl->ny;
+
+    float* srcReal = (float*)inReal.contents;
+    float* srcImag = (float*)inImag.contents;
+    float* dstReal = (float*)outReal.contents;
+    float* dstImag = (float*)outImag.contents;
+
+    if (!srcReal || !srcImag || !dstReal || !dstImag) {
+        fprintf(stderr, "Metal FFT ERROR: Buffer contents not accessible for CPU FFT\n");
+        return;
+    }
+
+    // Allocate temporary buffers for row/column processing
+    std::vector<float> tempReal(nx * ny);
+    std::vector<float> tempImag(nx * ny);
+    std::vector<float> rowReal(nx);
+    std::vector<float> rowImag(nx);
+    std::vector<float> colReal(ny);
+    std::vector<float> colImag(ny);
+
+    // Create separate setups for row and column transforms if sizes differ
+    vDSP_DFT_Setup rowSetupFwd = vDSP_DFT_zop_CreateSetup(nullptr, nx, vDSP_DFT_FORWARD);
+    vDSP_DFT_Setup rowSetupInv = vDSP_DFT_zop_CreateSetup(nullptr, nx, vDSP_DFT_INVERSE);
+    vDSP_DFT_Setup colSetupFwd = vDSP_DFT_zop_CreateSetup(nullptr, ny, vDSP_DFT_FORWARD);
+    vDSP_DFT_Setup colSetupInv = vDSP_DFT_zop_CreateSetup(nullptr, ny, vDSP_DFT_INVERSE);
+
+    vDSP_DFT_Setup rowSetup = (direction == FFT_FORWARD) ? rowSetupFwd : rowSetupInv;
+    vDSP_DFT_Setup colSetup = (direction == FFT_FORWARD) ? colSetupFwd : colSetupInv;
+
+    for (size_t b = 0; b < impl->batch; b++) {
+        size_t batchOffset = b * nx * ny;
+
+        // Step 1: FFT along rows
+        for (size_t y = 0; y < ny; y++) {
+            size_t rowOffset = batchOffset + y * nx;
+
+            // Copy row to temp buffers
+            memcpy(rowReal.data(), srcReal + rowOffset, nx * sizeof(float));
+            memcpy(rowImag.data(), srcImag + rowOffset, nx * sizeof(float));
+
+            // Execute row DFT
+            vDSP_DFT_Execute(rowSetup, rowReal.data(), rowImag.data(),
+                            tempReal.data() + y * nx, tempImag.data() + y * nx);
+        }
+
+        // Step 2: FFT along columns
+        for (size_t x = 0; x < nx; x++) {
+            // Extract column
+            for (size_t y = 0; y < ny; y++) {
+                colReal[y] = tempReal[y * nx + x];
+                colImag[y] = tempImag[y * nx + x];
+            }
+
+            // Execute column DFT
+            std::vector<float> colOutReal(ny), colOutImag(ny);
+            vDSP_DFT_Execute(colSetup, colReal.data(), colImag.data(),
+                            colOutReal.data(), colOutImag.data());
+
+            // Store back
+            for (size_t y = 0; y < ny; y++) {
+                dstReal[batchOffset + y * nx + x] = colOutReal[y];
+                dstImag[batchOffset + y * nx + x] = colOutImag[y];
+            }
+        }
+
+        // Scale for inverse FFT
+        if (direction == FFT_INVERSE) {
+            float scale = 1.0f / (float)(nx * ny);
+            vDSP_vsmul(dstReal + batchOffset, 1, &scale, dstReal + batchOffset, 1, nx * ny);
+            vDSP_vsmul(dstImag + batchOffset, 1, &scale, dstImag + batchOffset, 1, nx * ny);
+        }
+    }
+
+    // Cleanup
+    vDSP_DFT_DestroySetup(rowSetupFwd);
+    vDSP_DFT_DestroySetup(rowSetupInv);
+    vDSP_DFT_DestroySetup(colSetupFwd);
+    vDSP_DFT_DestroySetup(colSetupInv);
+}
+
+// Execute 3D DFT on CPU
+static void execute3DCPUFFT(FFTPlanImpl* impl,
+                            id<MTLBuffer> inReal, id<MTLBuffer> inImag,
+                            id<MTLBuffer> outReal, id<MTLBuffer> outImag,
+                            FFTDirection direction) {
+    size_t nx = impl->nx;
+    size_t ny = impl->ny;
+    size_t nz = impl->nz;
+    size_t nxy = nx * ny;
+    size_t nxyz = nx * ny * nz;
+
+    float* srcReal = (float*)inReal.contents;
+    float* srcImag = (float*)inImag.contents;
+    float* dstReal = (float*)outReal.contents;
+    float* dstImag = (float*)outImag.contents;
+
+    if (!srcReal || !srcImag || !dstReal || !dstImag) {
+        fprintf(stderr, "Metal FFT ERROR: Buffer contents not accessible for CPU FFT\n");
+        return;
+    }
+
+    // Allocate temporary buffers
+    std::vector<float> temp1Real(nxyz), temp1Imag(nxyz);
+    std::vector<float> temp2Real(nxyz), temp2Imag(nxyz);
+
+    // Create DFT setups for each dimension
+    vDSP_DFT_Setup xSetup = (direction == FFT_FORWARD) ?
+        vDSP_DFT_zop_CreateSetup(nullptr, nx, vDSP_DFT_FORWARD) :
+        vDSP_DFT_zop_CreateSetup(nullptr, nx, vDSP_DFT_INVERSE);
+    vDSP_DFT_Setup ySetup = (direction == FFT_FORWARD) ?
+        vDSP_DFT_zop_CreateSetup(nullptr, ny, vDSP_DFT_FORWARD) :
+        vDSP_DFT_zop_CreateSetup(nullptr, ny, vDSP_DFT_INVERSE);
+    vDSP_DFT_Setup zSetup = (direction == FFT_FORWARD) ?
+        vDSP_DFT_zop_CreateSetup(nullptr, nz, vDSP_DFT_FORWARD) :
+        vDSP_DFT_zop_CreateSetup(nullptr, nz, vDSP_DFT_INVERSE);
+
+    std::vector<float> lineReal, lineImag, lineOutReal, lineOutImag;
+
+    // Step 1: FFT along x (rows)
+    lineReal.resize(nx);
+    lineImag.resize(nx);
+    lineOutReal.resize(nx);
+    lineOutImag.resize(nx);
+
+    for (size_t z = 0; z < nz; z++) {
+        for (size_t y = 0; y < ny; y++) {
+            size_t offset = z * nxy + y * nx;
+            memcpy(lineReal.data(), srcReal + offset, nx * sizeof(float));
+            memcpy(lineImag.data(), srcImag + offset, nx * sizeof(float));
+
+            vDSP_DFT_Execute(xSetup, lineReal.data(), lineImag.data(),
+                            lineOutReal.data(), lineOutImag.data());
+
+            memcpy(temp1Real.data() + offset, lineOutReal.data(), nx * sizeof(float));
+            memcpy(temp1Imag.data() + offset, lineOutImag.data(), nx * sizeof(float));
+        }
+    }
+
+    // Step 2: FFT along y (columns)
+    lineReal.resize(ny);
+    lineImag.resize(ny);
+    lineOutReal.resize(ny);
+    lineOutImag.resize(ny);
+
+    for (size_t z = 0; z < nz; z++) {
+        for (size_t x = 0; x < nx; x++) {
+            // Extract column
+            for (size_t y = 0; y < ny; y++) {
+                lineReal[y] = temp1Real[z * nxy + y * nx + x];
+                lineImag[y] = temp1Imag[z * nxy + y * nx + x];
+            }
+
+            vDSP_DFT_Execute(ySetup, lineReal.data(), lineImag.data(),
+                            lineOutReal.data(), lineOutImag.data());
+
+            // Store back
+            for (size_t y = 0; y < ny; y++) {
+                temp2Real[z * nxy + y * nx + x] = lineOutReal[y];
+                temp2Imag[z * nxy + y * nx + x] = lineOutImag[y];
+            }
+        }
+    }
+
+    // Step 3: FFT along z
+    lineReal.resize(nz);
+    lineImag.resize(nz);
+    lineOutReal.resize(nz);
+    lineOutImag.resize(nz);
+
+    for (size_t y = 0; y < ny; y++) {
+        for (size_t x = 0; x < nx; x++) {
+            // Extract z-line
+            for (size_t z = 0; z < nz; z++) {
+                lineReal[z] = temp2Real[z * nxy + y * nx + x];
+                lineImag[z] = temp2Imag[z * nxy + y * nx + x];
+            }
+
+            vDSP_DFT_Execute(zSetup, lineReal.data(), lineImag.data(),
+                            lineOutReal.data(), lineOutImag.data());
+
+            // Store to output
+            for (size_t z = 0; z < nz; z++) {
+                dstReal[z * nxy + y * nx + x] = lineOutReal[z];
+                dstImag[z * nxy + y * nx + x] = lineOutImag[z];
+            }
+        }
+    }
+
+    // Scale for inverse FFT
+    if (direction == FFT_INVERSE) {
+        float scale = 1.0f / (float)nxyz;
+        vDSP_vsmul(dstReal, 1, &scale, dstReal, 1, nxyz);
+        vDSP_vsmul(dstImag, 1, &scale, dstImag, 1, nxyz);
+    }
+
+    // Cleanup
+    vDSP_DFT_DestroySetup(xSetup);
+    vDSP_DFT_DestroySetup(ySetup);
+    vDSP_DFT_DestroySetup(zSetup);
 }
 
 // Execute 1D FFT on GPU
@@ -679,18 +968,26 @@ void executeFFT(FFTPlan plan,
 
     FFTPlanImpl* impl = (FFTPlanImpl*)plan;
 
-    if (impl->useCPUFallback) {
-        fprintf(stderr, "Metal FFT WARNING: Using CPU fallback for FFT\n");
-        // CPU fallback path - not implemented for production use
-        return;
-    }
-
     // Cast buffers
     id<MTLBuffer> inReal = (__bridge id<MTLBuffer>)input_real;
     id<MTLBuffer> inImag = (__bridge id<MTLBuffer>)input_imag;
     id<MTLBuffer> outReal = (__bridge id<MTLBuffer>)output_real;
     id<MTLBuffer> outImag = (__bridge id<MTLBuffer>)output_imag;
 
+    if (impl->useCPUFallback) {
+        // Execute FFT using vDSP CPU implementation
+        // This is used for non-power-of-2 sizes where GPU radix-2 FFT doesn't work
+        if (impl->dimensions == 1) {
+            execute1DCPUFFT(impl, inReal, inImag, outReal, outImag, direction);
+        } else if (impl->dimensions == 2) {
+            execute2DCPUFFT(impl, inReal, inImag, outReal, outImag, direction);
+        } else if (impl->dimensions == 3) {
+            execute3DCPUFFT(impl, inReal, inImag, outReal, outImag, direction);
+        }
+        return;
+    }
+
+    // GPU FFT path for power-of-2 sizes
     if (impl->dimensions == 1) {
         execute1DGPUFFT(impl, inReal, inImag, outReal, outImag, direction);
     } else if (impl->dimensions == 2) {

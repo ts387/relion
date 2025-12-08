@@ -974,3 +974,430 @@ kernel void metal_kernel_backproject3D(
         }
     }
 }
+
+// ============================================================================
+// SGD Backprojection kernel (2D version)
+// For SGD, we backproject (image - projected_reference) instead of image
+// ============================================================================
+
+kernel void metal_kernel_backproject2D_SGD(
+    device const XFLOAT* g_img_real [[buffer(0)]],
+    device const XFLOAT* g_img_imag [[buffer(1)]],
+    device const XFLOAT* trans_x [[buffer(2)]],
+    device const XFLOAT* trans_y [[buffer(3)]],
+    device const XFLOAT* g_weights [[buffer(4)]],
+    device const XFLOAT* g_Minvsigma2s [[buffer(5)]],
+    device const XFLOAT* g_ctfs [[buffer(6)]],
+    device const XFLOAT* g_eulers [[buffer(7)]],
+    device const XFLOAT* mdlReal [[buffer(8)]],
+    device const XFLOAT* mdlImag [[buffer(9)]],
+    device atomic<float>* g_mdl_real [[buffer(10)]],
+    device atomic<float>* g_mdl_imag [[buffer(11)]],
+    device atomic<float>* g_mdl_weight [[buffer(12)]],
+    constant ProjectorParams& projector [[buffer(13)]],
+    constant int& image_size [[buffer(14)]],
+    constant uint& translation_num [[buffer(15)]],
+    constant float& significant_weight [[buffer(16)]],
+    constant float& weight_norm [[buffer(17)]],
+    constant int& ctf_premultiplied [[buffer(18)]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint bid [[threadgroup_position_in_grid]],
+    uint block_size [[threads_per_threadgroup]])
+{
+    // Each block processes one orientation
+    uint img = bid;
+    int img_y_half = projector.imgY / 2;
+    int max_r2_out = projector.maxR2 * projector.padding_factor * projector.padding_factor;
+
+    // Load Euler angles into threadgroup memory
+    threadgroup XFLOAT s_eulers[4];
+    if (tid == 0)
+        s_eulers[0] = g_eulers[img*9+0];
+    else if (tid == 1)
+        s_eulers[1] = g_eulers[img*9+1];
+    else if (tid == 2)
+        s_eulers[2] = g_eulers[img*9+3];
+    else if (tid == 3)
+        s_eulers[3] = g_eulers[img*9+4];
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    int pixel_pass_num = ceilfracf(image_size, (int)block_size);
+
+    for (int pass = 0; pass < pixel_pass_num; pass++)
+    {
+        uint pixel = pass * block_size + tid;
+
+        if (pixel >= (uint)image_size)
+            continue;
+
+        int x = pixel % projector.imgX;
+        int y = floorfracf(pixel, projector.imgX);
+
+        if (y > img_y_half)
+            y -= projector.imgY;
+
+        // Load per-pixel data
+        XFLOAT minvsigma2 = g_Minvsigma2s[pixel];
+        XFLOAT ctf = g_ctfs[pixel];
+        XFLOAT img_real = g_img_real[pixel];
+        XFLOAT img_imag = g_img_imag[pixel];
+
+        // Project reference model at this pixel
+        XFLOAT ref_real = 0.0f;
+        XFLOAT ref_imag = 0.0f;
+        project2Dmodel_notex(
+            mdlReal, mdlImag, projector,
+            x, y,
+            s_eulers[0], s_eulers[1],
+            s_eulers[2], s_eulers[3],
+            ref_real, ref_imag);
+
+        // Multiply reference by CTF
+        ref_real *= ctf;
+        ref_imag *= ctf;
+
+        // Accumulate weighted differences across translations
+        XFLOAT Fweight = 0.0f;
+        XFLOAT real = 0.0f;
+        XFLOAT imag = 0.0f;
+
+        for (uint itrans = 0; itrans < translation_num; itrans++)
+        {
+            XFLOAT weight = g_weights[img * translation_num + itrans];
+
+            if (weight >= significant_weight)
+            {
+                XFLOAT adjusted_weight;
+                if (ctf_premultiplied)
+                {
+                    adjusted_weight = (weight / weight_norm) * minvsigma2;
+                    Fweight += adjusted_weight * ctf;
+                }
+                else
+                {
+                    adjusted_weight = (weight / weight_norm) * ctf * minvsigma2;
+                    Fweight += adjusted_weight * ctf;
+                }
+
+                // Apply translation to image
+                XFLOAT temp_real, temp_imag;
+                translatePixel(x, y, trans_x[itrans], trans_y[itrans],
+                              img_real, img_imag, temp_real, temp_imag);
+
+                // SGD: accumulate (image - reference) * weight
+                real += (temp_real - ref_real) * adjusted_weight;
+                imag += (temp_imag - ref_imag) * adjusted_weight;
+            }
+        }
+
+        // Backproject if we have accumulated weight
+        if (Fweight > 0.0f)
+        {
+            // Get logical coordinates in the model
+            XFLOAT xp = (s_eulers[0] * x + s_eulers[1] * y) * projector.padding_factor;
+            XFLOAT yp = (s_eulers[2] * x + s_eulers[3] * y) * projector.padding_factor;
+
+            // Check bounds
+            if ((xp * xp + yp * yp) > max_r2_out)
+                continue;
+
+            // Handle Hermitian symmetry
+            if (xp < 0)
+            {
+                xp = -xp;
+                yp = -yp;
+                imag = -imag;
+            }
+
+            int x0 = int(floor(xp));
+            XFLOAT fx = xp - x0;
+            int x1 = x0 + 1;
+
+            int y0 = int(floor(yp));
+            XFLOAT fy = yp - y0;
+            y0 -= projector.mdlInitY;
+            int y1 = y0 + 1;
+
+            XFLOAT mfx = 1.0f - fx;
+            XFLOAT mfy = 1.0f - fy;
+
+            XFLOAT dd00 = mfy * mfx;
+            XFLOAT dd01 = mfy * fx;
+            XFLOAT dd10 = fy * mfx;
+            XFLOAT dd11 = fy * fx;
+
+            int mdlY = projector.mdlXY / projector.mdlX;
+            if (x0 >= 0 && x0 < projector.mdlX - 1 &&
+                y0 >= 0 && y0 < mdlY - 1)
+            {
+                atomic_fetch_add_explicit(&g_mdl_real[y0 * projector.mdlX + x0], dd00 * real, memory_order_relaxed);
+                atomic_fetch_add_explicit(&g_mdl_imag[y0 * projector.mdlX + x0], dd00 * imag, memory_order_relaxed);
+                atomic_fetch_add_explicit(&g_mdl_weight[y0 * projector.mdlX + x0], dd00 * Fweight, memory_order_relaxed);
+
+                atomic_fetch_add_explicit(&g_mdl_real[y0 * projector.mdlX + x1], dd01 * real, memory_order_relaxed);
+                atomic_fetch_add_explicit(&g_mdl_imag[y0 * projector.mdlX + x1], dd01 * imag, memory_order_relaxed);
+                atomic_fetch_add_explicit(&g_mdl_weight[y0 * projector.mdlX + x1], dd01 * Fweight, memory_order_relaxed);
+
+                atomic_fetch_add_explicit(&g_mdl_real[y1 * projector.mdlX + x0], dd10 * real, memory_order_relaxed);
+                atomic_fetch_add_explicit(&g_mdl_imag[y1 * projector.mdlX + x0], dd10 * imag, memory_order_relaxed);
+                atomic_fetch_add_explicit(&g_mdl_weight[y1 * projector.mdlX + x0], dd10 * Fweight, memory_order_relaxed);
+
+                atomic_fetch_add_explicit(&g_mdl_real[y1 * projector.mdlX + x1], dd11 * real, memory_order_relaxed);
+                atomic_fetch_add_explicit(&g_mdl_imag[y1 * projector.mdlX + x1], dd11 * imag, memory_order_relaxed);
+                atomic_fetch_add_explicit(&g_mdl_weight[y1 * projector.mdlX + x1], dd11 * Fweight, memory_order_relaxed);
+            }
+        }
+    }
+}
+
+// ============================================================================
+// SGD Backprojection kernel (3D version)
+// For SGD, we backproject (image - projected_reference) instead of image
+// ============================================================================
+
+kernel void metal_kernel_backproject3D_SGD(
+    device const XFLOAT* g_img_real [[buffer(0)]],
+    device const XFLOAT* g_img_imag [[buffer(1)]],
+    device const XFLOAT* trans_x [[buffer(2)]],
+    device const XFLOAT* trans_y [[buffer(3)]],
+    device const XFLOAT* trans_z [[buffer(4)]],
+    device const XFLOAT* g_weights [[buffer(5)]],
+    device const XFLOAT* g_Minvsigma2s [[buffer(6)]],
+    device const XFLOAT* g_ctfs [[buffer(7)]],
+    device const XFLOAT* g_eulers [[buffer(8)]],
+    device const XFLOAT* mdlReal [[buffer(9)]],
+    device const XFLOAT* mdlImag [[buffer(10)]],
+    device atomic<float>* g_mdl_real [[buffer(11)]],
+    device atomic<float>* g_mdl_imag [[buffer(12)]],
+    device atomic<float>* g_mdl_weight [[buffer(13)]],
+    constant ProjectorParams& projector [[buffer(14)]],
+    constant int& image_size [[buffer(15)]],
+    constant uint& translation_num [[buffer(16)]],
+    constant float& significant_weight [[buffer(17)]],
+    constant float& weight_norm [[buffer(18)]],
+    constant int& ctf_premultiplied [[buffer(19)]],
+    constant int& data3D [[buffer(20)]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint bid [[threadgroup_position_in_grid]],
+    uint block_size [[threads_per_threadgroup]])
+{
+    // Each block processes one orientation
+    uint img = bid;
+    int img_y_half = projector.imgY / 2;
+    int img_z_half = projector.imgZ / 2;
+    int max_r2_vol = projector.maxR2 * projector.padding_factor * projector.padding_factor;
+
+    // Load Euler angles into threadgroup memory
+    threadgroup XFLOAT s_eulers[9];
+    if (tid < 9)
+        s_eulers[tid] = g_eulers[img*9+tid];
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    int pixel_pass_num = ceilfracf(image_size, (int)block_size);
+
+    for (int pass = 0; pass < pixel_pass_num; pass++)
+    {
+        uint pixel = pass * block_size + tid;
+
+        if (pixel >= (uint)image_size)
+            continue;
+
+        int x, y, z, xy;
+
+        if (data3D)
+        {
+            z = floorfracf(pixel, projector.imgX * projector.imgY);
+            xy = pixel % (projector.imgX * projector.imgY);
+            x = xy % projector.imgX;
+            y = floorfracf(xy, projector.imgX);
+
+            if (z > img_z_half)
+            {
+                z = z - projector.imgZ;
+                if (x == 0)
+                    continue;
+            }
+        }
+        else
+        {
+            x = pixel % projector.imgX;
+            y = floorfracf(pixel, projector.imgX);
+            z = 0;
+        }
+
+        if (y > img_y_half)
+            y = y - projector.imgY;
+
+        // Load per-pixel data
+        XFLOAT minvsigma2 = g_Minvsigma2s[pixel];
+        XFLOAT ctf = g_ctfs[pixel];
+        XFLOAT img_real = g_img_real[pixel];
+        XFLOAT img_imag = g_img_imag[pixel];
+
+        // Project reference model at this pixel
+        XFLOAT ref_real = 0.0f;
+        XFLOAT ref_imag = 0.0f;
+
+        if (data3D)
+        {
+            project3Dmodel_notex(
+                mdlReal, mdlImag, projector,
+                x, y, z,
+                s_eulers[0], s_eulers[1], s_eulers[2],
+                s_eulers[3], s_eulers[4], s_eulers[5],
+                s_eulers[6], s_eulers[7], s_eulers[8],
+                ref_real, ref_imag);
+        }
+        else
+        {
+            // 2D projection into 3D model (z=0)
+            project3Dmodel_notex(
+                mdlReal, mdlImag, projector,
+                x, y, 0,
+                s_eulers[0], s_eulers[1], 0.0f,
+                s_eulers[3], s_eulers[4], 0.0f,
+                s_eulers[6], s_eulers[7], 0.0f,
+                ref_real, ref_imag);
+        }
+
+        // Multiply reference by CTF
+        ref_real *= ctf;
+        ref_imag *= ctf;
+
+        // Accumulate weighted differences across translations
+        XFLOAT Fweight = 0.0f;
+        XFLOAT real = 0.0f;
+        XFLOAT imag = 0.0f;
+
+        for (uint itrans = 0; itrans < translation_num; itrans++)
+        {
+            XFLOAT weight = g_weights[img * translation_num + itrans];
+
+            if (weight >= significant_weight)
+            {
+                XFLOAT adjusted_weight;
+                if (ctf_premultiplied)
+                {
+                    adjusted_weight = (weight / weight_norm) * minvsigma2;
+                    Fweight += adjusted_weight * ctf;
+                }
+                else
+                {
+                    adjusted_weight = (weight / weight_norm) * ctf * minvsigma2;
+                    Fweight += adjusted_weight * ctf;
+                }
+
+                // Apply translation to image
+                XFLOAT temp_real, temp_imag;
+                if (data3D)
+                    translatePixel3D(x, y, z, trans_x[itrans], trans_y[itrans], trans_z[itrans],
+                                    img_real, img_imag, temp_real, temp_imag);
+                else
+                    translatePixel(x, y, trans_x[itrans], trans_y[itrans],
+                                  img_real, img_imag, temp_real, temp_imag);
+
+                // SGD: accumulate (image - reference) * weight
+                real += (temp_real - ref_real) * adjusted_weight;
+                imag += (temp_imag - ref_imag) * adjusted_weight;
+            }
+        }
+
+        // Backproject if we have accumulated weight
+        if (Fweight > 0.0f)
+        {
+            // Get logical coordinates in the 3D model
+            XFLOAT xp, yp, zp;
+            if (data3D)
+            {
+                xp = (s_eulers[0] * x + s_eulers[1] * y + s_eulers[2] * z) * projector.padding_factor;
+                yp = (s_eulers[3] * x + s_eulers[4] * y + s_eulers[5] * z) * projector.padding_factor;
+                zp = (s_eulers[6] * x + s_eulers[7] * y + s_eulers[8] * z) * projector.padding_factor;
+            }
+            else
+            {
+                xp = (s_eulers[0] * x + s_eulers[1] * y) * projector.padding_factor;
+                yp = (s_eulers[3] * x + s_eulers[4] * y) * projector.padding_factor;
+                zp = (s_eulers[6] * x + s_eulers[7] * y) * projector.padding_factor;
+            }
+
+            // Check bounds
+            if ((xp * xp + yp * yp + zp * zp) > max_r2_vol)
+                continue;
+
+            // Handle Hermitian symmetry
+            if (xp < 0)
+            {
+                xp = -xp;
+                yp = -yp;
+                zp = -zp;
+                imag = -imag;
+            }
+
+            int x0 = int(floor(xp));
+            XFLOAT fx = xp - x0;
+            int x1 = x0 + 1;
+
+            int y0 = int(floor(yp));
+            XFLOAT fy = yp - y0;
+            y0 -= projector.mdlInitY;
+            int y1 = y0 + 1;
+
+            int z0 = int(floor(zp));
+            XFLOAT fz = zp - z0;
+            z0 -= projector.mdlInitZ;
+            int z1 = z0 + 1;
+
+            XFLOAT mfx = 1.0f - fx;
+            XFLOAT mfy = 1.0f - fy;
+            XFLOAT mfz = 1.0f - fz;
+
+            int mdlY = projector.mdlXY / projector.mdlX;
+            if (x0 >= 0 && x0 < projector.mdlX - 1 &&
+                y0 >= 0 && y0 < mdlY - 1 &&
+                z0 >= 0 && z0 < projector.mdlZ - 1)
+            {
+                XFLOAT dd000 = mfz * mfy * mfx;
+                atomic_fetch_add_explicit(&g_mdl_real[z0 * projector.mdlXY + y0 * projector.mdlX + x0], dd000 * real, memory_order_relaxed);
+                atomic_fetch_add_explicit(&g_mdl_imag[z0 * projector.mdlXY + y0 * projector.mdlX + x0], dd000 * imag, memory_order_relaxed);
+                atomic_fetch_add_explicit(&g_mdl_weight[z0 * projector.mdlXY + y0 * projector.mdlX + x0], dd000 * Fweight, memory_order_relaxed);
+
+                XFLOAT dd001 = mfz * mfy * fx;
+                atomic_fetch_add_explicit(&g_mdl_real[z0 * projector.mdlXY + y0 * projector.mdlX + x1], dd001 * real, memory_order_relaxed);
+                atomic_fetch_add_explicit(&g_mdl_imag[z0 * projector.mdlXY + y0 * projector.mdlX + x1], dd001 * imag, memory_order_relaxed);
+                atomic_fetch_add_explicit(&g_mdl_weight[z0 * projector.mdlXY + y0 * projector.mdlX + x1], dd001 * Fweight, memory_order_relaxed);
+
+                XFLOAT dd010 = mfz * fy * mfx;
+                atomic_fetch_add_explicit(&g_mdl_real[z0 * projector.mdlXY + y1 * projector.mdlX + x0], dd010 * real, memory_order_relaxed);
+                atomic_fetch_add_explicit(&g_mdl_imag[z0 * projector.mdlXY + y1 * projector.mdlX + x0], dd010 * imag, memory_order_relaxed);
+                atomic_fetch_add_explicit(&g_mdl_weight[z0 * projector.mdlXY + y1 * projector.mdlX + x0], dd010 * Fweight, memory_order_relaxed);
+
+                XFLOAT dd011 = mfz * fy * fx;
+                atomic_fetch_add_explicit(&g_mdl_real[z0 * projector.mdlXY + y1 * projector.mdlX + x1], dd011 * real, memory_order_relaxed);
+                atomic_fetch_add_explicit(&g_mdl_imag[z0 * projector.mdlXY + y1 * projector.mdlX + x1], dd011 * imag, memory_order_relaxed);
+                atomic_fetch_add_explicit(&g_mdl_weight[z0 * projector.mdlXY + y1 * projector.mdlX + x1], dd011 * Fweight, memory_order_relaxed);
+
+                XFLOAT dd100 = fz * mfy * mfx;
+                atomic_fetch_add_explicit(&g_mdl_real[z1 * projector.mdlXY + y0 * projector.mdlX + x0], dd100 * real, memory_order_relaxed);
+                atomic_fetch_add_explicit(&g_mdl_imag[z1 * projector.mdlXY + y0 * projector.mdlX + x0], dd100 * imag, memory_order_relaxed);
+                atomic_fetch_add_explicit(&g_mdl_weight[z1 * projector.mdlXY + y0 * projector.mdlX + x0], dd100 * Fweight, memory_order_relaxed);
+
+                XFLOAT dd101 = fz * mfy * fx;
+                atomic_fetch_add_explicit(&g_mdl_real[z1 * projector.mdlXY + y0 * projector.mdlX + x1], dd101 * real, memory_order_relaxed);
+                atomic_fetch_add_explicit(&g_mdl_imag[z1 * projector.mdlXY + y0 * projector.mdlX + x1], dd101 * imag, memory_order_relaxed);
+                atomic_fetch_add_explicit(&g_mdl_weight[z1 * projector.mdlXY + y0 * projector.mdlX + x1], dd101 * Fweight, memory_order_relaxed);
+
+                XFLOAT dd110 = fz * fy * mfx;
+                atomic_fetch_add_explicit(&g_mdl_real[z1 * projector.mdlXY + y1 * projector.mdlX + x0], dd110 * real, memory_order_relaxed);
+                atomic_fetch_add_explicit(&g_mdl_imag[z1 * projector.mdlXY + y1 * projector.mdlX + x0], dd110 * imag, memory_order_relaxed);
+                atomic_fetch_add_explicit(&g_mdl_weight[z1 * projector.mdlXY + y1 * projector.mdlX + x0], dd110 * Fweight, memory_order_relaxed);
+
+                XFLOAT dd111 = fz * fy * fx;
+                atomic_fetch_add_explicit(&g_mdl_real[z1 * projector.mdlXY + y1 * projector.mdlX + x1], dd111 * real, memory_order_relaxed);
+                atomic_fetch_add_explicit(&g_mdl_imag[z1 * projector.mdlXY + y1 * projector.mdlX + x1], dd111 * imag, memory_order_relaxed);
+                atomic_fetch_add_explicit(&g_mdl_weight[z1 * projector.mdlXY + y1 * projector.mdlX + x1], dd111 * Fweight, memory_order_relaxed);
+            }
+        }
+    }
+}
