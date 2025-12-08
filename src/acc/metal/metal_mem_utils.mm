@@ -3,6 +3,65 @@
 #import <Metal/Metal.h>
 #import <Foundation/Foundation.h>
 #include <cstring>
+#include <mutex>
+#include <unordered_map>
+
+// ============================================================================
+// Buffer Registry: Maps data pointers (buffer.contents) to MTLBuffer objects
+// ============================================================================
+// This is critical because RELION passes around data pointers (XFLOAT*) to kernels,
+// but Metal's encoder.setBuffer() requires MTLBuffer objects. We maintain a registry
+// to look up the MTLBuffer from its contents pointer.
+
+static std::unordered_map<const void*, id<MTLBuffer>> g_buffer_registry;
+static std::mutex g_buffer_registry_mutex;
+
+// Register a buffer in the registry (called after allocation)
+void metalRegisterBuffer(MTLBufferPtr buffer) {
+    if (!buffer) return;
+
+    @autoreleasepool {
+        id<MTLBuffer> mtlBuffer = (__bridge id<MTLBuffer>)buffer;
+        void* contents = mtlBuffer.contents;
+
+        if (contents) {
+            std::lock_guard<std::mutex> lock(g_buffer_registry_mutex);
+            g_buffer_registry[contents] = mtlBuffer;
+        }
+    }
+}
+
+// Unregister a buffer from the registry (called before deallocation)
+void metalUnregisterBuffer(MTLBufferPtr buffer) {
+    if (!buffer) return;
+
+    @autoreleasepool {
+        id<MTLBuffer> mtlBuffer = (__bridge id<MTLBuffer>)buffer;
+        void* contents = mtlBuffer.contents;
+
+        if (contents) {
+            std::lock_guard<std::mutex> lock(g_buffer_registry_mutex);
+            g_buffer_registry.erase(contents);
+        }
+    }
+}
+
+// Look up MTLBuffer from a data pointer
+MTLBufferPtr metalGetBufferFromPointer(const void* dataPtr) {
+    if (!dataPtr) return nullptr;
+
+    std::lock_guard<std::mutex> lock(g_buffer_registry_mutex);
+    auto it = g_buffer_registry.find(dataPtr);
+    if (it != g_buffer_registry.end()) {
+        return (__bridge MTLBufferPtr)it->second;
+    }
+
+    // Not found - this is a programming error
+    fprintf(stderr, "Metal ERROR: Buffer not found in registry for pointer %p\n", dataPtr);
+    fprintf(stderr, "             This likely means the pointer was not allocated via metalAllocateDevice\n");
+    fprintf(stderr, "             or the buffer was freed before use.\n");
+    return nullptr;
+}
 
 // Convert MetalMemoryMode to MTLResourceOptions
 static MTLResourceOptions getMTLResourceOptions(MetalMemoryMode mode) {
@@ -41,13 +100,21 @@ void* metalAllocateDevice(MTLDevicePtr device, size_t size, MetalMemoryMode mode
             return nullptr;
         }
 
-        return (__bridge_retained void*)buffer;
+        // Register buffer in the pointer-to-buffer registry
+        // This allows kernel launchers to look up the MTLBuffer from data pointers
+        void* result = (__bridge_retained void*)buffer;
+        metalRegisterBuffer((MTLBufferPtr)result);
+
+        return result;
     }
 }
 
 void metalFreeDevice(MTLBufferPtr buffer) {
     @autoreleasepool {
         if (buffer) {
+            // Unregister from the pointer-to-buffer registry before freeing
+            metalUnregisterBuffer(buffer);
+
             // Transfer ownership back and release
             id<MTLBuffer> mtlBuffer = (__bridge_transfer id<MTLBuffer>)buffer;
             mtlBuffer = nil;

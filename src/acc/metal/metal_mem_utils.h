@@ -31,8 +31,22 @@ typedef id<MTLBuffer> MTLBufferPtr;
 typedef id<MTLCommandQueue> MTLCommandQueuePtr;
 #endif
 
-// Allocate device buffer
+// Allocate device buffer (returns MTLBuffer as void*)
+// The returned pointer is the MTLBuffer object, NOT the data pointer
 void* metalAllocateDevice(MTLDevicePtr device, size_t size, MetalMemoryMode mode);
+
+// Look up MTLBuffer from a data pointer (buffer.contents)
+// This is essential for kernel launchers that receive data pointers
+// Returns NULL if the pointer is not found in the registry
+MTLBufferPtr metalGetBufferFromPointer(const void* dataPtr);
+
+// Register a buffer in the pointer-to-buffer registry
+// Called automatically by metalAllocateDevice for shared/managed buffers
+void metalRegisterBuffer(MTLBufferPtr buffer);
+
+// Unregister a buffer from the pointer-to-buffer registry
+// Called automatically by metalFreeDevice
+void metalUnregisterBuffer(MTLBufferPtr buffer);
 
 // Free device buffer
 void metalFreeDevice(MTLBufferPtr buffer);
@@ -72,7 +86,7 @@ public:
     static void deallocate(void* buffer);
     static void copyToDevice(void* buffer, const void* hostPtr, size_t size, size_t offset = 0);
     static void copyFromDevice(void* hostPtr, void* buffer, size_t size, size_t offset = 0);
-    static void copy DeviceToDevice(void* dst, void* src, size_t size, void* queue);
+    static void copyDeviceToDevice(void* dst, void* src, size_t size, void* queue);
     static void memset(void* buffer, int value, size_t size, void* queue);
     static void* getPointer(void* buffer);
     static size_t getSize(void* buffer);

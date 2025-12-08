@@ -4,11 +4,17 @@
 #import <Foundation/Foundation.h>
 #include <vector>
 #include <string>
+#include <mutex>
+#include <set>
 
 // Global state
 static NSArray<id<MTLDevice>>* g_devices = nil;
 static int g_currentDevice = 0;
 static bool g_initialized = false;
+
+// Track active command queues for synchronization
+static std::set<id<MTLCommandQueue>> g_activeQueues;
+static std::mutex g_queuesMutex;
 
 extern "C" {
 
@@ -109,7 +115,9 @@ const char* metalGetDeviceName(int deviceId) {
 
     @autoreleasepool {
         id<MTLDevice> device = g_devices[deviceId];
-        static char nameBuf[256];
+        // Use thread_local to avoid race conditions when multiple threads
+        // request device names simultaneously
+        thread_local char nameBuf[256];
         strncpy(nameBuf, [device.name UTF8String], sizeof(nameBuf) - 1);
         nameBuf[sizeof(nameBuf) - 1] = '\0';
         return nameBuf;
@@ -202,6 +210,12 @@ void* metalCreateCommandQueue(void* device) {
             return nullptr;
         }
 
+        // Track this queue for global synchronization
+        {
+            std::lock_guard<std::mutex> lock(g_queuesMutex);
+            g_activeQueues.insert(queue);
+        }
+
         return (__bridge_retained void*)queue;
     }
 }
@@ -210,16 +224,34 @@ void metalDestroyCommandQueue(void* queue) {
     @autoreleasepool {
         if (queue) {
             id<MTLCommandQueue> mtlQueue = (__bridge_transfer id<MTLCommandQueue>)queue;
+
+            // Remove from tracking set
+            {
+                std::lock_guard<std::mutex> lock(g_queuesMutex);
+                g_activeQueues.erase(mtlQueue);
+            }
+
             mtlQueue = nil;
         }
     }
 }
 
 void metalDeviceSynchronize() {
-    // Metal operations are inherently asynchronous
-    // To synchronize, we'd need to wait on all active command buffers
-    // This is typically done via command buffer completion handlers
-    // For now, this is a no-op
+    // Synchronize all tracked command queues by submitting and waiting
+    // on empty command buffers for each queue
+    @autoreleasepool {
+        std::lock_guard<std::mutex> lock(g_queuesMutex);
+
+        for (id<MTLCommandQueue> queue : g_activeQueues) {
+            if (queue) {
+                id<MTLCommandBuffer> cmdBuffer = [queue commandBuffer];
+                if (cmdBuffer) {
+                    [cmdBuffer commit];
+                    [cmdBuffer waitUntilCompleted];
+                }
+            }
+        }
+    }
 }
 
 void metalQueueSynchronize(void* queue) {

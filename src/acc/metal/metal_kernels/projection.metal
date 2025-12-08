@@ -51,8 +51,10 @@ inline void project2Dmodel_notex(
         XFLOAT fx = xp - x0;
         XFLOAT fy = yp - y0;
 
+        // mdlXY = mdlX * mdlY, so mdlY = mdlXY / mdlX
+        int mdlY = proj.mdlXY / proj.mdlX;
         x0 = clamp(x0, 0, proj.mdlX - 2);
-        y0 = clamp(y0, 0, proj.mdlX - 2);
+        y0 = clamp(y0, 0, mdlY - 2);
 
         int x1 = x0 + 1;
         int y1 = y0 + 1;
@@ -116,8 +118,10 @@ inline void project3Dmodel_notex(
         XFLOAT fy = yp - y0;
         XFLOAT fz = zp - z0;
 
+        // mdlXY = mdlX * mdlY, so mdlY = mdlXY / mdlX
+        int mdlY = proj.mdlXY / proj.mdlX;
         x0 = clamp(x0, 0, proj.mdlX - 2);
-        y0 = clamp(y0, 0, proj.mdlX - 2);
+        y0 = clamp(y0, 0, mdlY - 2);
         z0 = clamp(z0, 0, proj.mdlZ - 2);
 
         int x1 = x0 + 1;
@@ -383,8 +387,10 @@ kernel void metal_kernel_backproject2D(
             XFLOAT fx = xp - x0;
             XFLOAT fy = yp - y0;
 
+            // mdlXY = mdlX * mdlY, so mdlY = mdlXY / mdlX
+            int mdlY = projector.mdlXY / projector.mdlX;
             if (x0 >= 0 && x0 < projector.mdlX - 1 &&
-                y0 >= 0 && y0 < projector.mdlX - 1)
+                y0 >= 0 && y0 < mdlY - 1)
             {
                 // Weighted bilinear splat into 4 neighboring voxels
                 XFLOAT w00 = weight * (1-fx) * (1-fy);
@@ -908,8 +914,10 @@ kernel void metal_kernel_backproject3D(
             XFLOAT fy = yp - y0;
             XFLOAT fz = zp - z0;
 
+            // mdlXY = mdlX * mdlY, so mdlY = mdlXY / mdlX
+            int mdlY = projector.mdlXY / projector.mdlX;
             if (x0 >= 0 && x0 < projector.mdlX - 1 &&
-                y0 >= 0 && y0 < projector.mdlX - 1 &&
+                y0 >= 0 && y0 < mdlY - 1 &&
                 z0 >= 0 && z0 < projector.mdlZ - 1)
             {
                 // 8 neighboring voxels for trilinear splat

@@ -1,11 +1,30 @@
 #import "src/acc/metal/metal_kernels.h"
 #import "src/acc/metal/metal_device.h"
 #import "src/acc/metal/metal_kernel_utils.h"
+#import "src/acc/metal/metal_mem_utils.h"
 #import <Metal/Metal.h>
 #import <Foundation/Foundation.h>
 #import <mach/mach_time.h>
 
 #ifdef _METAL_ENABLED
+
+// Helper macro to look up MTLBuffer from a data pointer
+// The pointer may be either a data pointer (buffer.contents) or already an MTLBuffer
+// We first try the registry lookup; if that fails, we fall back to direct cast
+// (for cases where the pointer was never registered, e.g., temporary buffers)
+static inline id<MTLBuffer> getBuffer(const void* ptr) {
+    if (!ptr) return nil;
+
+    // Try to find in registry (for pointers from Alloc::getPtr())
+    MTLBufferPtr found = metalGetBufferFromPointer(ptr);
+    if (found) {
+        return (__bridge id<MTLBuffer>)found;
+    }
+
+    // Fallback: assume ptr is already an MTLBuffer (for compatibility)
+    // This handles cases where buffers weren't registered
+    return (__bridge id<MTLBuffer>)ptr;
+}
 
 namespace MetalKernels {
 
@@ -226,17 +245,17 @@ void diff2_coarse_impl(
 
         [encoder setComputePipelineState:pipeline];
 
-        // Set buffers
-        [encoder setBuffer:(__bridge id<MTLBuffer>)g_eulers offset:0 atIndex:0];
-        [encoder setBuffer:(__bridge id<MTLBuffer>)trans_x offset:0 atIndex:1];
-        [encoder setBuffer:(__bridge id<MTLBuffer>)trans_y offset:0 atIndex:2];
+        // Set buffers - use getBuffer() to look up MTLBuffer from data pointers
+        [encoder setBuffer:getBuffer(g_eulers) offset:0 atIndex:0];
+        [encoder setBuffer:getBuffer(trans_x) offset:0 atIndex:1];
+        [encoder setBuffer:getBuffer(trans_y) offset:0 atIndex:2];
 
         if (is_3D) {
-            [encoder setBuffer:(__bridge id<MTLBuffer>)trans_z offset:0 atIndex:3];
-            [encoder setBuffer:(__bridge id<MTLBuffer>)g_real offset:0 atIndex:4];
-            [encoder setBuffer:(__bridge id<MTLBuffer>)g_imag offset:0 atIndex:5];
-            [encoder setBuffer:(__bridge id<MTLBuffer>)mdlReal offset:0 atIndex:6];
-            [encoder setBuffer:(__bridge id<MTLBuffer>)mdlImag offset:0 atIndex:7];
+            [encoder setBuffer:getBuffer(trans_z) offset:0 atIndex:3];
+            [encoder setBuffer:getBuffer(g_real) offset:0 atIndex:4];
+            [encoder setBuffer:getBuffer(g_imag) offset:0 atIndex:5];
+            [encoder setBuffer:getBuffer(mdlReal) offset:0 atIndex:6];
+            [encoder setBuffer:getBuffer(mdlImag) offset:0 atIndex:7];
 
             // Projector params as constants
             [encoder setBytes:&mdlX length:sizeof(int) atIndex:8];
@@ -251,8 +270,8 @@ void diff2_coarse_impl(
             [encoder setBytes:&maxR2 length:sizeof(int) atIndex:17];
             [encoder setBytes:&padding_factor length:sizeof(XFLOAT) atIndex:18];
 
-            [encoder setBuffer:(__bridge id<MTLBuffer>)g_corr offset:0 atIndex:19];
-            [encoder setBuffer:(__bridge id<MTLBuffer>)g_diff2s offset:0 atIndex:20];
+            [encoder setBuffer:getBuffer(g_corr) offset:0 atIndex:19];
+            [encoder setBuffer:getBuffer(g_diff2s) offset:0 atIndex:20];
 
             int trans_num = (int)translation_num;
             int img_size = (int)image_size;
@@ -261,10 +280,10 @@ void diff2_coarse_impl(
             [encoder setBytes:&eulers_per_block length:sizeof(int) atIndex:23];
             [encoder setBytes:&prefetch_fraction length:sizeof(int) atIndex:24];
         } else {
-            [encoder setBuffer:(__bridge id<MTLBuffer>)g_real offset:0 atIndex:3];
-            [encoder setBuffer:(__bridge id<MTLBuffer>)g_imag offset:0 atIndex:4];
-            [encoder setBuffer:(__bridge id<MTLBuffer>)mdlReal offset:0 atIndex:5];
-            [encoder setBuffer:(__bridge id<MTLBuffer>)mdlImag offset:0 atIndex:6];
+            [encoder setBuffer:getBuffer(g_real) offset:0 atIndex:3];
+            [encoder setBuffer:getBuffer(g_imag) offset:0 atIndex:4];
+            [encoder setBuffer:getBuffer(mdlReal) offset:0 atIndex:5];
+            [encoder setBuffer:getBuffer(mdlImag) offset:0 atIndex:6];
 
             // Projector params
             [encoder setBytes:&mdlX length:sizeof(int) atIndex:7];
@@ -276,8 +295,8 @@ void diff2_coarse_impl(
             [encoder setBytes:&maxR2 length:sizeof(int) atIndex:13];
             [encoder setBytes:&padding_factor length:sizeof(XFLOAT) atIndex:14];
 
-            [encoder setBuffer:(__bridge id<MTLBuffer>)g_corr offset:0 atIndex:15];
-            [encoder setBuffer:(__bridge id<MTLBuffer>)g_diff2s offset:0 atIndex:16];
+            [encoder setBuffer:getBuffer(g_corr) offset:0 atIndex:15];
+            [encoder setBuffer:getBuffer(g_diff2s) offset:0 atIndex:16];
 
             int trans_num = (int)translation_num;
             int img_size = (int)image_size;
@@ -360,18 +379,18 @@ void diff2_fine_impl(
 
         // Set buffers based on dimensionality
         int bufIdx = 0;
-        [encoder setBuffer:(__bridge id<MTLBuffer>)g_eulers offset:0 atIndex:bufIdx++];
-        [encoder setBuffer:(__bridge id<MTLBuffer>)g_imgs_real offset:0 atIndex:bufIdx++];
-        [encoder setBuffer:(__bridge id<MTLBuffer>)g_imgs_imag offset:0 atIndex:bufIdx++];
-        [encoder setBuffer:(__bridge id<MTLBuffer>)trans_x offset:0 atIndex:bufIdx++];
-        [encoder setBuffer:(__bridge id<MTLBuffer>)trans_y offset:0 atIndex:bufIdx++];
+        [encoder setBuffer:getBuffer(g_eulers) offset:0 atIndex:bufIdx++];
+        [encoder setBuffer:getBuffer(g_imgs_real) offset:0 atIndex:bufIdx++];
+        [encoder setBuffer:getBuffer(g_imgs_imag) offset:0 atIndex:bufIdx++];
+        [encoder setBuffer:getBuffer(trans_x) offset:0 atIndex:bufIdx++];
+        [encoder setBuffer:getBuffer(trans_y) offset:0 atIndex:bufIdx++];
 
         if (is_3D) {
-            [encoder setBuffer:(__bridge id<MTLBuffer>)trans_z offset:0 atIndex:bufIdx++];
+            [encoder setBuffer:getBuffer(trans_z) offset:0 atIndex:bufIdx++];
         }
 
-        [encoder setBuffer:(__bridge id<MTLBuffer>)mdlReal offset:0 atIndex:bufIdx++];
-        [encoder setBuffer:(__bridge id<MTLBuffer>)mdlImag offset:0 atIndex:bufIdx++];
+        [encoder setBuffer:getBuffer(mdlReal) offset:0 atIndex:bufIdx++];
+        [encoder setBuffer:getBuffer(mdlImag) offset:0 atIndex:bufIdx++];
 
         // Projector params
         [encoder setBytes:&mdlX length:sizeof(int) atIndex:bufIdx++];
@@ -386,8 +405,8 @@ void diff2_fine_impl(
         [encoder setBytes:&maxR2 length:sizeof(int) atIndex:bufIdx++];
         [encoder setBytes:&padding_factor length:sizeof(XFLOAT) atIndex:bufIdx++];
 
-        [encoder setBuffer:(__bridge id<MTLBuffer>)g_corr_img offset:0 atIndex:bufIdx++];
-        [encoder setBuffer:(__bridge id<MTLBuffer>)g_diff2s offset:0 atIndex:bufIdx++];
+        [encoder setBuffer:getBuffer(g_corr_img) offset:0 atIndex:bufIdx++];
+        [encoder setBuffer:getBuffer(g_diff2s) offset:0 atIndex:bufIdx++];
 
         uint img_sz = (uint)image_size;
         [encoder setBytes:&img_sz length:sizeof(uint) atIndex:bufIdx++];
@@ -398,10 +417,10 @@ void diff2_fine_impl(
         [encoder setBytes:&orient_num length:sizeof(uint) atIndex:bufIdx++];
         [encoder setBytes:&trans_num length:sizeof(uint) atIndex:bufIdx++];
 
-        [encoder setBuffer:(__bridge id<MTLBuffer>)d_rot_idx offset:0 atIndex:bufIdx++];
-        [encoder setBuffer:(__bridge id<MTLBuffer>)d_trans_idx offset:0 atIndex:bufIdx++];
-        [encoder setBuffer:(__bridge id<MTLBuffer>)d_job_idx offset:0 atIndex:bufIdx++];
-        [encoder setBuffer:(__bridge id<MTLBuffer>)d_job_num offset:0 atIndex:bufIdx++];
+        [encoder setBuffer:getBuffer(d_rot_idx) offset:0 atIndex:bufIdx++];
+        [encoder setBuffer:getBuffer(d_trans_idx) offset:0 atIndex:bufIdx++];
+        [encoder setBuffer:getBuffer(d_job_idx) offset:0 atIndex:bufIdx++];
+        [encoder setBuffer:getBuffer(d_job_num) offset:0 atIndex:bufIdx++];
 
         [encoder setBytes:&block_size length:sizeof(int) atIndex:bufIdx++];
         [encoder setBytes:&chunk_sz length:sizeof(int) atIndex:bufIdx++];
@@ -454,15 +473,15 @@ void backproject2D(
 
         [encoder setComputePipelineState:pipeline];
 
-        [encoder setBuffer:(__bridge id<MTLBuffer>)g_img_real offset:0 atIndex:0];
-        [encoder setBuffer:(__bridge id<MTLBuffer>)g_img_imag offset:0 atIndex:1];
-        [encoder setBuffer:(__bridge id<MTLBuffer>)trans_x offset:0 atIndex:2];
-        [encoder setBuffer:(__bridge id<MTLBuffer>)trans_y offset:0 atIndex:3];
-        [encoder setBuffer:(__bridge id<MTLBuffer>)g_weights offset:0 atIndex:4];
-        [encoder setBuffer:(__bridge id<MTLBuffer>)g_eulers offset:0 atIndex:5];
-        [encoder setBuffer:(__bridge id<MTLBuffer>)g_mdl_real offset:0 atIndex:6];
-        [encoder setBuffer:(__bridge id<MTLBuffer>)g_mdl_imag offset:0 atIndex:7];
-        [encoder setBuffer:(__bridge id<MTLBuffer>)g_mdl_weight offset:0 atIndex:8];
+        [encoder setBuffer:getBuffer(g_img_real) offset:0 atIndex:0];
+        [encoder setBuffer:getBuffer(g_img_imag) offset:0 atIndex:1];
+        [encoder setBuffer:getBuffer(trans_x) offset:0 atIndex:2];
+        [encoder setBuffer:getBuffer(trans_y) offset:0 atIndex:3];
+        [encoder setBuffer:getBuffer(g_weights) offset:0 atIndex:4];
+        [encoder setBuffer:getBuffer(g_eulers) offset:0 atIndex:5];
+        [encoder setBuffer:getBuffer(g_mdl_real) offset:0 atIndex:6];
+        [encoder setBuffer:getBuffer(g_mdl_imag) offset:0 atIndex:7];
+        [encoder setBuffer:getBuffer(g_mdl_weight) offset:0 atIndex:8];
 
         id<MTLBuffer> projParams = createProjectorParamsBuffer(projector);
         [encoder setBuffer:projParams offset:0 atIndex:9];
@@ -510,16 +529,16 @@ void backproject3D(
 
         [encoder setComputePipelineState:pipeline];
 
-        [encoder setBuffer:(__bridge id<MTLBuffer>)g_img_real offset:0 atIndex:0];
-        [encoder setBuffer:(__bridge id<MTLBuffer>)g_img_imag offset:0 atIndex:1];
-        [encoder setBuffer:(__bridge id<MTLBuffer>)trans_x offset:0 atIndex:2];
-        [encoder setBuffer:(__bridge id<MTLBuffer>)trans_y offset:0 atIndex:3];
-        [encoder setBuffer:(__bridge id<MTLBuffer>)trans_z offset:0 atIndex:4];
-        [encoder setBuffer:(__bridge id<MTLBuffer>)g_weights offset:0 atIndex:5];
-        [encoder setBuffer:(__bridge id<MTLBuffer>)g_eulers offset:0 atIndex:6];
-        [encoder setBuffer:(__bridge id<MTLBuffer>)g_mdl_real offset:0 atIndex:7];
-        [encoder setBuffer:(__bridge id<MTLBuffer>)g_mdl_imag offset:0 atIndex:8];
-        [encoder setBuffer:(__bridge id<MTLBuffer>)g_mdl_weight offset:0 atIndex:9];
+        [encoder setBuffer:getBuffer(g_img_real) offset:0 atIndex:0];
+        [encoder setBuffer:getBuffer(g_img_imag) offset:0 atIndex:1];
+        [encoder setBuffer:getBuffer(trans_x) offset:0 atIndex:2];
+        [encoder setBuffer:getBuffer(trans_y) offset:0 atIndex:3];
+        [encoder setBuffer:getBuffer(trans_z) offset:0 atIndex:4];
+        [encoder setBuffer:getBuffer(g_weights) offset:0 atIndex:5];
+        [encoder setBuffer:getBuffer(g_eulers) offset:0 atIndex:6];
+        [encoder setBuffer:getBuffer(g_mdl_real) offset:0 atIndex:7];
+        [encoder setBuffer:getBuffer(g_mdl_imag) offset:0 atIndex:8];
+        [encoder setBuffer:getBuffer(g_mdl_weight) offset:0 atIndex:9];
 
         id<MTLBuffer> projParams = createProjectorParamsBuffer(projector);
         [encoder setBuffer:projParams offset:0 atIndex:10];
@@ -614,12 +633,12 @@ void wavg(
 
         [encoder setComputePipelineState:pipeline];
 
-        [encoder setBuffer:(__bridge id<MTLBuffer>)g_img_real offset:0 atIndex:0];
-        [encoder setBuffer:(__bridge id<MTLBuffer>)g_img_imag offset:0 atIndex:1];
-        [encoder setBuffer:(__bridge id<MTLBuffer>)g_img_weight offset:0 atIndex:2];
-        [encoder setBuffer:(__bridge id<MTLBuffer>)g_out_real offset:0 atIndex:3];
-        [encoder setBuffer:(__bridge id<MTLBuffer>)g_out_imag offset:0 atIndex:4];
-        [encoder setBuffer:(__bridge id<MTLBuffer>)g_out_weight offset:0 atIndex:5];
+        [encoder setBuffer:getBuffer(g_img_real) offset:0 atIndex:0];
+        [encoder setBuffer:getBuffer(g_img_imag) offset:0 atIndex:1];
+        [encoder setBuffer:getBuffer(g_img_weight) offset:0 atIndex:2];
+        [encoder setBuffer:getBuffer(g_out_real) offset:0 atIndex:3];
+        [encoder setBuffer:getBuffer(g_out_imag) offset:0 atIndex:4];
+        [encoder setBuffer:getBuffer(g_out_weight) offset:0 atIndex:5];
 
         float pw = (float)particle_weight;
         int sz = (int)size;
@@ -655,7 +674,7 @@ void exponentiate(
         id<MTLComputeCommandEncoder> encoder = [cmdBuffer computeCommandEncoder];
 
         [encoder setComputePipelineState:pipeline];
-        [encoder setBuffer:(__bridge id<MTLBuffer>)g_array offset:0 atIndex:0];
+        [encoder setBuffer:getBuffer(g_array) offset:0 atIndex:0];
 
         float addVal = (float)add;
         uint sz = (uint)size;
@@ -700,7 +719,7 @@ void softMaskOutsideMap(
         id<MTLComputeCommandEncoder> encoder = [cmdBuffer computeCommandEncoder];
 
         [encoder setComputePipelineState:pipeline];
-        [encoder setBuffer:(__bridge id<MTLBuffer>)vol offset:0 atIndex:0];
+        [encoder setBuffer:getBuffer(vol) offset:0 atIndex:0];
 
         uint xd = (uint)xdim, yd = (uint)ydim, zd = (uint)zdim;
         int xi = (int)xinit, yi = (int)yinit, zi = (int)zinit;
@@ -741,9 +760,9 @@ void multiply(
         id<MTLComputeCommandEncoder> encoder = [cmdBuffer computeCommandEncoder];
 
         [encoder setComputePipelineState:pipeline];
-        [encoder setBuffer:(__bridge id<MTLBuffer>)A offset:0 atIndex:0];
-        [encoder setBuffer:(__bridge id<MTLBuffer>)B offset:0 atIndex:1];
-        [encoder setBuffer:(__bridge id<MTLBuffer>)OUT offset:0 atIndex:2];
+        [encoder setBuffer:getBuffer(A) offset:0 atIndex:0];
+        [encoder setBuffer:getBuffer(B) offset:0 atIndex:1];
+        [encoder setBuffer:getBuffer(OUT) offset:0 atIndex:2];
 
         uint sz = (uint)size;
         [encoder setBytes:&sz length:sizeof(uint) atIndex:3];
@@ -775,15 +794,15 @@ void multiplyCTFs(
         id<MTLComputeCommandEncoder> encoder = [cmdBuffer computeCommandEncoder];
 
         [encoder setComputePipelineState:pipeline];
-        [encoder setBuffer:(__bridge id<MTLBuffer>)g_Fref_real offset:0 atIndex:0];
-        [encoder setBuffer:(__bridge id<MTLBuffer>)g_Fref_imag offset:0 atIndex:1];
-        [encoder setBuffer:(__bridge id<MTLBuffer>)g_ctf offset:0 atIndex:2];
+        [encoder setBuffer:getBuffer(g_Fref_real) offset:0 atIndex:0];
+        [encoder setBuffer:getBuffer(g_Fref_imag) offset:0 atIndex:1];
+        [encoder setBuffer:getBuffer(g_ctf) offset:0 atIndex:2];
 
         uint doScale = do_scale_correction ? 1 : 0;
         [encoder setBytes:&doScale length:sizeof(uint) atIndex:3];
 
         if (do_scale_correction && g_scale_correction) {
-            [encoder setBuffer:(__bridge id<MTLBuffer>)g_scale_correction offset:0 atIndex:4];
+            [encoder setBuffer:getBuffer(g_scale_correction) offset:0 atIndex:4];
         } else {
             // Create dummy buffer
             id<MTLBuffer> dummy = [g_device newBufferWithLength:sizeof(float) options:MTLResourceStorageModeShared];
@@ -818,8 +837,8 @@ void applyWeights(
         id<MTLComputeCommandEncoder> encoder = [cmdBuffer computeCommandEncoder];
 
         [encoder setComputePipelineState:pipeline];
-        [encoder setBuffer:(__bridge id<MTLBuffer>)g_diff2s offset:0 atIndex:0];
-        [encoder setBuffer:(__bridge id<MTLBuffer>)g_weights offset:0 atIndex:1];
+        [encoder setBuffer:getBuffer(g_diff2s) offset:0 atIndex:0];
+        [encoder setBuffer:getBuffer(g_weights) offset:0 atIndex:1];
 
         float wt = (float)weight;
         uint sz = (uint)size;
@@ -857,7 +876,7 @@ void initRNG(
         id<MTLComputeCommandEncoder> encoder = [cmdBuffer computeCommandEncoder];
 
         [encoder setComputePipelineState:pipeline];
-        [encoder setBuffer:(__bridge id<MTLBuffer>)rng_states offset:0 atIndex:0];
+        [encoder setBuffer:getBuffer(rng_states) offset:0 atIndex:0];
 
         uint num_states = (uint)size;
         uint seed_lo = (uint)(seed & 0xFFFFFFFF);
@@ -899,10 +918,10 @@ void generateNormalDistribution2D(
         id<MTLComputeCommandEncoder> encoder = [cmdBuffer computeCommandEncoder];
 
         [encoder setComputePipelineState:pipeline];
-        [encoder setBuffer:(__bridge id<MTLBuffer>)rng_states offset:0 atIndex:0];
-        [encoder setBuffer:(__bridge id<MTLBuffer>)g_out_real offset:0 atIndex:1];
-        [encoder setBuffer:(__bridge id<MTLBuffer>)g_out_imag offset:0 atIndex:2];
-        [encoder setBuffer:(__bridge id<MTLBuffer>)g_spectra offset:0 atIndex:3];
+        [encoder setBuffer:getBuffer(rng_states) offset:0 atIndex:0];
+        [encoder setBuffer:getBuffer(g_out_real) offset:0 atIndex:1];
+        [encoder setBuffer:getBuffer(g_out_imag) offset:0 atIndex:2];
+        [encoder setBuffer:getBuffer(g_spectra) offset:0 atIndex:3];
 
         uint xd = (uint)xdim;
         uint yd = (uint)ydim;
@@ -940,10 +959,10 @@ void generateNormalDistribution3D(
         id<MTLComputeCommandEncoder> encoder = [cmdBuffer computeCommandEncoder];
 
         [encoder setComputePipelineState:pipeline];
-        [encoder setBuffer:(__bridge id<MTLBuffer>)rng_states offset:0 atIndex:0];
-        [encoder setBuffer:(__bridge id<MTLBuffer>)g_out_real offset:0 atIndex:1];
-        [encoder setBuffer:(__bridge id<MTLBuffer>)g_out_imag offset:0 atIndex:2];
-        [encoder setBuffer:(__bridge id<MTLBuffer>)g_spectra offset:0 atIndex:3];
+        [encoder setBuffer:getBuffer(rng_states) offset:0 atIndex:0];
+        [encoder setBuffer:getBuffer(g_out_real) offset:0 atIndex:1];
+        [encoder setBuffer:getBuffer(g_out_imag) offset:0 atIndex:2];
+        [encoder setBuffer:getBuffer(g_spectra) offset:0 atIndex:3];
 
         uint xd = (uint)xdim;
         uint yd = (uint)ydim;
